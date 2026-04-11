@@ -26,8 +26,8 @@ SAVE_DIR.mkdir(exist_ok=True)
 RTSP_URL = "rtsp://192.168.0.166:7447/YD4arutidcyKjQvI"
 STREAM_PREVIEW_INTERVAL = 3000  # ms between live preview refreshes
 
-# Buffer config
-BUFFER_SECONDS = 2.0          # how many seconds of frames to keep
+# Buffer config — defaults (live values come from UI vars after root is created)
+BUFFER_SECONDS = 3.0          # how many seconds of frames to keep
 FRAME_INTERVAL = 0.5          # grab a frame every N seconds for buffer
 SNAP_BACK_SECS = 1.0          # go back this far on webhook
 SNAP_FORWARD_SECS = 0.5       # then grab a frame this far forward
@@ -97,8 +97,8 @@ def buffer_worker():
         _fail_count = 0
         now = time.time()
 
-        # Throttle: only store a frame every FRAME_INTERVAL seconds
-        if now - _last_frame_ts < FRAME_INTERVAL:
+        # Throttle: only store a frame every capture-interval seconds
+        if now - _last_frame_ts < frame_interval_var.get():
             continue
         _last_frame_ts = now
 
@@ -108,7 +108,7 @@ def buffer_worker():
 
         with buffer_lock:
             frame_buffer.append((now, data))
-            cutoff = now - BUFFER_SECONDS
+            cutoff = now - buffer_secs_var.get()
             while frame_buffer and frame_buffer[0][0] < cutoff:
                 frame_buffer.popleft()
 
@@ -374,14 +374,16 @@ def queue_worker():
                 save_event_background(None, None, image_bytes, result, None, ts_str)
                 continue
 
-            # --- Get frame A: 1s BEFORE webhook ---
-            ts_a = trigger_ts - SNAP_BACK_SECS
+            # --- Get frame A: N seconds BEFORE webhook ---
+            snap_back  = snap_back_var.get()
+            snap_fwd   = snap_forward_var.get()
+            ts_a = trigger_ts - snap_back
             frame_a = get_frame_at(ts_a)
 
-            # --- Get frame B: 0.5s AFTER webhook ---
-            # Wait briefly to let buffer catch up
-            time.sleep(SNAP_FORWARD_SECS + 0.2)
-            ts_b = trigger_ts + SNAP_FORWARD_SECS
+            # --- Get frame B: N seconds AFTER webhook ---
+            # Wait briefly to let the buffer catch up to ts_b
+            time.sleep(snap_fwd + 0.2)
+            ts_b = trigger_ts + snap_fwd
             frame_b = get_frame_at(ts_b)
 
             if frame_a is None or frame_b is None:
@@ -550,6 +552,12 @@ root.geometry("1100x860")
 root.configure(bg="#0a0a0a")
 root.resizable(True, True)
 
+# --- Tunable timing vars ---
+snap_back_var      = tk.DoubleVar(value=SNAP_BACK_SECS)
+snap_forward_var   = tk.DoubleVar(value=SNAP_FORWARD_SECS)
+frame_interval_var = tk.DoubleVar(value=FRAME_INTERVAL)
+buffer_secs_var    = tk.DoubleVar(value=BUFFER_SECONDS)
+
 # Status bar
 status_var = tk.StringVar(value="Starting...")
 tk.Label(root, textvariable=status_var, bg="#0a0a0a", fg="#444444",
@@ -657,6 +665,32 @@ snap_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
 timer_var = tk.StringVar(value="⏱  —")
 tk.Label(action_row, textvariable=timer_var, bg="#0a0a0a", fg="#00aaff",
          font=("Courier New", 12, "bold"), padx=14).pack(side=tk.RIGHT)
+
+# Timing config
+timing_frame = tk.Frame(root, bg="#0a0a0a")
+timing_frame.pack(fill=tk.X, padx=14, pady=(4, 2))
+
+tk.Label(timing_frame, text="TIMING", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(side=tk.LEFT, padx=(0, 14))
+
+def _timing_spin(parent, label, var, from_, to, increment):
+    f = tk.Frame(parent, bg="#0a0a0a")
+    f.pack(side=tk.LEFT, padx=(0, 14))
+    tk.Label(f, text=label, bg="#0a0a0a", fg="#555555",
+             font=("Courier New", 8)).pack(side=tk.LEFT)
+    sb = tk.Spinbox(f, textvariable=var, from_=from_, to=to, increment=increment,
+                    format="%.1f", width=5,
+                    bg="#111111", fg="#00ff88", buttonbackground="#1a1a1a",
+                    relief=tk.FLAT, font=("Courier New", 9),
+                    insertbackground="#00ff88", highlightthickness=0)
+    sb.pack(side=tk.LEFT, padx=(4, 0))
+    tk.Label(f, text="s", bg="#0a0a0a", fg="#444444",
+             font=("Courier New", 8)).pack(side=tk.LEFT, padx=(2, 0))
+
+_timing_spin(timing_frame, "before",   snap_back_var,      0.1, 10.0, 0.1)
+_timing_spin(timing_frame, "after",    snap_forward_var,   0.1, 10.0, 0.1)
+_timing_spin(timing_frame, "capture",  frame_interval_var, 0.1,  5.0, 0.1)
+_timing_spin(timing_frame, "buffer",   buffer_secs_var,    1.0, 30.0, 0.5)
 
 # Prompt
 tk.Label(root, text="PROMPT", bg="#0a0a0a", fg="#333333",
