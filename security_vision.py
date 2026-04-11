@@ -559,8 +559,9 @@ def queue_worker():
                 elapsed = time.time() - t0
 
                 _b = item["image_b64"]
-                root.after(0, lambda b=_b, vr=vision_result, tr=text_result, t=ts_str, e=elapsed:
-                           finish_analysis(b, vr, tr, t, e))
+                _ti = full_text_prompt
+                root.after(0, lambda b=_b, vr=vision_result, ti=_ti, tr=text_result, t=ts_str, e=elapsed:
+                           finish_analysis(b, vr, ti, tr, t, e))
                 save_event_background(None, None, image_bytes, text_result, None, ts_str)
                 continue
 
@@ -612,8 +613,9 @@ def queue_worker():
             elapsed = time.time() - t0
 
             _b64 = crop_b64
-            root.after(0, lambda b=_b64, vr=vision_result, tr=text_result, t=ts_str, e=elapsed:
-                       finish_analysis(b, vr, tr, t, e))
+            _ti  = full_text_prompt
+            root.after(0, lambda b=_b64, vr=vision_result, ti=_ti, tr=text_result, t=ts_str, e=elapsed:
+                       finish_analysis(b, vr, ti, tr, t, e))
 
             save_event_background(frame_a, frame_b, cropped_bytes,
                                   f"VISION:\n{vision_result}\n\nJUDGMENT:\n{text_result}",
@@ -627,9 +629,11 @@ def queue_worker():
             analysis_queue.task_done()
             root.after(0, update_queue_status)
 
-def finish_analysis(image_b64, vision_result, text_result, ts, elapsed):
+def finish_analysis(image_b64, vision_result, text_input, text_result, ts, elapsed):
     timer_var.set(f"⏱  {elapsed:.2f}s")
     show_detected_image(image_b64)
+
+    # --- Camera tab output ---
     output_text.config(state=tk.NORMAL)
     output_text.delete("1.0", tk.END)
     output_text.tag_configure("dim",   foreground="#555555", font=("Courier New", 9))
@@ -640,6 +644,28 @@ def finish_analysis(image_b64, vision_result, text_result, ts, elapsed):
     output_text.insert(tk.END, "🧠  JUDGMENT\n", "label")
     output_text.insert(tk.END, text_result, "main")
     output_text.config(state=tk.DISABLED)
+
+    # --- Master tab detection panel ---
+    try:
+        img_data = base64.b64decode(image_b64)
+        img = Image.open(io.BytesIO(img_data))
+        img.thumbnail((220, 150), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(img)
+        master_detected_label.config(image=photo, text="", width=img.width, height=img.height)
+        master_detected_label.image = photo
+    except Exception:
+        pass
+
+    def _set_text(widget, content):
+        widget.config(state=tk.NORMAL)
+        widget.delete("1.0", tk.END)
+        widget.insert(tk.END, content)
+        widget.config(state=tk.DISABLED)
+
+    _set_text(master_vision_text, vision_result)
+    _set_text(master_input_text,  text_input)
+    _set_text(master_result_text, text_result)
+
     update_queue_status()
 
 def enqueue_event(ts_float, ts_str, source="webhook", image_b64=None):
@@ -1046,9 +1072,15 @@ def load_config():
 # ---------------------------------------------------------------
 root = tk.Tk()
 root.title("Security Vision — Preston" + (" [DEBUG]" if DEBUG_MODE else ""))
-root.geometry("1100x860")
+root.geometry("1200x900")
 root.configure(bg="#0a0a0a")
 root.resizable(True, True)
+
+# Force combobox dropdown list to use black text on white background (Windows fix)
+root.option_add("*TCombobox*Listbox.background",       "#ffffff")
+root.option_add("*TCombobox*Listbox.foreground",       "#000000")
+root.option_add("*TCombobox*Listbox.selectBackground", "#cceecc")
+root.option_add("*TCombobox*Listbox.selectForeground", "#000000")
 
 # --- All tunable vars ---
 snap_before_var   = tk.DoubleVar(value=SNAP_BEFORE_SECS)
@@ -1204,7 +1236,7 @@ _timing_spin(timing_frame, "min box",  min_box_pct_var,  0.0, 10.0, 0.01, unit="
 # ═══════════════════════════════════════════════
 
 master_cols = tk.Frame(tab_master, bg="#0a0a0a")
-master_cols.pack(fill=tk.BOTH, expand=True)
+master_cols.pack(fill=tk.X, expand=False)
 
 # ── LEFT COLUMN ──────────────────────────────
 master_left = tk.Frame(master_cols, bg="#0a0a0a")
@@ -1361,6 +1393,57 @@ for group_name, entities in HA_GROUPS:
 
 ha_list.update_idletasks()
 ha_canvas.configure(scrollregion=ha_canvas.bbox("all"))
+
+# ═══════════════════════════════════════════════
+# MASTER TAB — DETECTION RESULTS (bottom panel)
+# ═══════════════════════════════════════════════
+tk.Frame(tab_master, bg="#222222", height=1).pack(fill=tk.X, padx=14, pady=(4, 0))
+
+det_outer = tk.Frame(tab_master, bg="#0a0a0a")
+det_outer.pack(fill=tk.BOTH, expand=True, padx=14, pady=(6, 10))
+
+tk.Label(det_outer, text="LAST DETECTION", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 6))
+
+det_inner = tk.Frame(det_outer, bg="#0a0a0a")
+det_inner.pack(fill=tk.BOTH, expand=True)
+
+# 1. Cropped image
+det_img_col = tk.Frame(det_inner, bg="#0a0a0a")
+det_img_col.pack(side=tk.LEFT, padx=(0, 10), anchor="n")
+tk.Label(det_img_col, text="CROP", bg="#0a0a0a", fg="#333333",
+         font=("Courier New", 7, "bold")).pack(anchor="w")
+master_detected_label = tk.Label(det_img_col, bg="#111111",
+                                  text="—", fg="#333333",
+                                  font=("Courier New", 8),
+                                  width=28, height=9, anchor="center")
+master_detected_label.pack()
+
+def _make_det_col(parent, title, font_size=8, fg="#888888"):
+    col = tk.Frame(parent, bg="#0a0a0a")
+    col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
+    tk.Label(col, text=title, bg="#0a0a0a", fg="#333333",
+             font=("Courier New", 7, "bold")).pack(anchor="w")
+    inner = tk.Frame(col, bg="#0a0a0a")
+    inner.pack(fill=tk.BOTH, expand=True)
+    txt = tk.Text(inner, bg="#111111", fg=fg,
+                  font=("Courier New", font_size), relief=tk.FLAT,
+                  padx=6, pady=6, wrap=tk.WORD,
+                  state=tk.DISABLED, selectbackground="#003322")
+    scr = tk.Scrollbar(inner, command=txt.yview, bg="#111111")
+    txt.configure(yscrollcommand=scr.set)
+    scr.pack(side=tk.RIGHT, fill=tk.Y)
+    txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    return txt
+
+# 2. Vision model result
+master_vision_text = _make_det_col(det_inner, "VISION RESULT",  font_size=8, fg="#666666")
+
+# 3. Text model input (full prompt sent to text model)
+master_input_text  = _make_det_col(det_inner, "TEXT MODEL INPUT", font_size=7, fg="#444444")
+
+# 4. Text model result
+master_result_text = _make_det_col(det_inner, "JUDGMENT",       font_size=9, fg="#e0e0e0")
 
 # ---------------------------------------------------------------
 # START SERVICES
