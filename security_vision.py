@@ -31,7 +31,7 @@ BUFFER_SECONDS = 3.0          # how many seconds of frames to keep
 FRAME_INTERVAL = 0.2          # grab a frame every N seconds for buffer (not tunable)
 SNAP_BEFORE_SECS = 2.5        # frame A: this many seconds before the trigger
 SNAP_AFTER_SECS  = 2.0        # frame B: this many seconds before the trigger (closer)
-CROP_PADDING = 50             # px padding around bounding box
+CROP_PADDING = 50             # px padding around bounding box (default, overridden by UI var)
 
 DEBUG_MODE = True             # show debug windows
 
@@ -206,10 +206,11 @@ def compute_motion_crop(frame_a_bytes, frame_b_bytes):
         y2 = max(cv2.boundingRect(c)[1] + cv2.boundingRect(c)[3] for c in contours)
 
         # Add padding, clamp to frame
-        x1p = max(0, x1 - CROP_PADDING)
-        y1p = max(0, y1 - CROP_PADDING)
-        x2p = min(w, x2 + CROP_PADDING)
-        y2p = min(h, y2 + CROP_PADDING)
+        pad = int(crop_padding_var.get())
+        x1p = max(0, x1 - pad)
+        y1p = max(0, y1 - pad)
+        x2p = min(w, x2 + pad)
+        y2p = min(h, y2 + pad)
         bbox = (x1p, y1p, x2p, y2p)
 
         # Crop from frame_b
@@ -721,9 +722,10 @@ root.configure(bg="#0a0a0a")
 root.resizable(True, True)
 
 # --- Tunable timing vars (all relative to webhook trigger, seconds back in time) ---
-snap_before_var = tk.DoubleVar(value=SNAP_BEFORE_SECS)   # frame A
-snap_after_var  = tk.DoubleVar(value=SNAP_AFTER_SECS)    # frame B (closer to trigger)
-buffer_secs_var = tk.DoubleVar(value=BUFFER_SECONDS)
+snap_before_var   = tk.DoubleVar(value=SNAP_BEFORE_SECS)
+snap_after_var    = tk.DoubleVar(value=SNAP_AFTER_SECS)
+buffer_secs_var   = tk.DoubleVar(value=BUFFER_SECONDS)
+crop_padding_var  = tk.IntVar(value=CROP_PADDING)
 
 # Status bar
 status_var = tk.StringVar(value="Starting...")
@@ -865,6 +867,18 @@ def _timing_spin(parent, label, var, from_, to, increment):
 _timing_spin(timing_frame, "buffer",  buffer_secs_var,  0.5, 30.0, 0.5)
 _timing_spin(timing_frame, "before",  snap_before_var,  0.1, 29.0, 0.1)
 _timing_spin(timing_frame, "after",   snap_after_var,   0.0, 29.0, 0.1)
+
+# Crop padding (px) — separate label since it's not a time value
+f_pad = tk.Frame(timing_frame, bg="#0a0a0a")
+f_pad.pack(side=tk.LEFT, padx=(0, 14))
+tk.Label(f_pad, text="padding", bg="#0a0a0a", fg="#555555",
+         font=("Courier New", 8)).pack(side=tk.LEFT)
+tk.Spinbox(f_pad, textvariable=crop_padding_var, from_=0, to=500, increment=10,
+           width=5, bg="#111111", fg="#00ff88", buttonbackground="#1a1a1a",
+           relief=tk.FLAT, font=("Courier New", 9),
+           insertbackground="#00ff88", highlightthickness=0).pack(side=tk.LEFT, padx=(4, 0))
+tk.Label(f_pad, text="px", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8)).pack(side=tk.LEFT, padx=(2, 0))
 
 # Prompt
 tk.Label(root, text="PROMPT", bg="#0a0a0a", fg="#333333",
