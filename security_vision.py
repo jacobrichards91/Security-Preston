@@ -6,8 +6,6 @@ import requests
 import base64
 import time
 import os
-import subprocess
-import tempfile
 import collections
 import io
 import numpy as np
@@ -56,63 +54,66 @@ buffer_lock = threading.Lock()
 # FRAME BUFFER WORKER
 # Continuously grabs frames via FFmpeg and stores in rolling buffer
 # ---------------------------------------------------------------
-def grab_raw_frame():
-    """Grab one raw JPEG from RTSP. Returns bytes or None."""
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-            tmp_path = tmp.name
-        cmd = [
-            "ffmpeg",
-            "-rtsp_transport", "tcp",
-            "-i", RTSP_URL,
-            "-frames:v", "1",
-            "-q:v", "2",
-            "-update", "1",
-            "-y",
-            tmp_path
-        ]
-        stderr_pipe = None if DEBUG_MODE else subprocess.DEVNULL
-        result = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                                stderr=stderr_pipe, timeout=15)
-        if result.returncode == 0 and Path(tmp_path).exists():
-            data = Path(tmp_path).read_bytes()
-            Path(tmp_path).unlink(missing_ok=True)
-            return data
-        Path(tmp_path).unlink(missing_ok=True)
-        return None
-    except Exception as e:
-        if DEBUG_MODE:
-            print(f"[RTSP] grab_raw_frame error: {e}")
-        return None
-
 def buffer_worker():
-    """Continuously grab frames and maintain rolling buffer."""
+    """Open RTSP stream once with OpenCV and maintain a rolling frame buffer."""
+    cap = None
     _fail_count = 0
+    _last_frame_ts = 0.0
+
     while True:
-        t0 = time.time()
-        data = grab_raw_frame()
-        if data:
+        # (Re)open the capture if needed
+        if cap is None or not cap.isOpened():
+            if cap is not None:
+                cap.release()
+            root.after(0, lambda: stream_status_var.set("⏳ Connecting to stream..."))
+            if DEBUG_MODE:
+                print(f"[RTSP] Opening stream (attempt {_fail_count + 1}): {RTSP_URL}")
+            cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # keep latency low
+            if not cap.isOpened():
+                _fail_count += 1
+                if DEBUG_MODE:
+                    print(f"[RTSP] Could not open stream (attempt {_fail_count})")
+                root.after(0, lambda n=_fail_count: stream_status_var.set(
+                    f"🔴 Disconnected — retrying... (attempt {n})"
+                ))
+                time.sleep(2)
+                continue
             _fail_count = 0
-            ts = time.time()
-            with buffer_lock:
-                frame_buffer.append((ts, data))
-                # Prune frames older than BUFFER_SECONDS
-                cutoff = ts - BUFFER_SECONDS
-                while frame_buffer and frame_buffer[0][0] < cutoff:
-                    frame_buffer.popleft()
-            # Update live preview in UI
-            b64 = base64.b64encode(data).decode()
-            root.after(0, lambda b=b64: update_stream_preview(b))
-        else:
+
+        ret, frame = cap.read()
+        if not ret:
             _fail_count += 1
             if DEBUG_MODE:
-                print(f"[RTSP] Frame grab failed (attempt {_fail_count}) — {RTSP_URL}")
+                print(f"[RTSP] Read failed — reconnecting (attempt {_fail_count})")
             root.after(0, lambda n=_fail_count: stream_status_var.set(
-                f"🔴 Disconnected — retrying... (attempt {n})"
+                f"🔴 Stream lost — reconnecting... (attempt {n})"
             ))
-        elapsed = time.time() - t0
-        sleep = max(0, FRAME_INTERVAL - elapsed)
-        time.sleep(sleep)
+            cap.release()
+            cap = None
+            time.sleep(1)
+            continue
+
+        _fail_count = 0
+        now = time.time()
+
+        # Throttle: only store a frame every FRAME_INTERVAL seconds
+        if now - _last_frame_ts < FRAME_INTERVAL:
+            continue
+        _last_frame_ts = now
+
+        # Encode to JPEG bytes and store in buffer
+        _, enc = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        data = enc.tobytes()
+
+        with buffer_lock:
+            frame_buffer.append((now, data))
+            cutoff = now - BUFFER_SECONDS
+            while frame_buffer and frame_buffer[0][0] < cutoff:
+                frame_buffer.popleft()
+
+        b64 = base64.b64encode(data).decode()
+        root.after(0, lambda b=b64: update_stream_preview(b))
 
 def get_frame_at(target_ts):
     """Get the buffered frame closest to target_ts. Returns bytes or None."""
