@@ -8,6 +8,7 @@ import time
 import os
 import collections
 import io
+import json
 import numpy as np
 import cv2
 from PIL import Image, ImageTk, ImageDraw
@@ -22,6 +23,7 @@ DEFAULT_MODEL = "minicpm-v:latest"
 WEBHOOK_PORT = 8765
 SAVE_DIR = Path(os.path.expanduser("~")) / "SecurityEvents"
 SAVE_DIR.mkdir(exist_ok=True)
+CONFIG_PATH = Path(__file__).parent / "config.json"
 
 RTSP_URL = "rtsp://192.168.0.166:7447/YD4arutidcyKjQvI"
 STREAM_PREVIEW_INTERVAL = 3000  # ms between live preview refreshes
@@ -654,6 +656,7 @@ def open_mask_wizard():
         ny2 = min(native_h, int(y2_d * scale_y))
         mask_rects.append((nx1, ny1, nx2, ny2))
         redraw()
+        schedule_save()
 
     def on_right_click(e):
         # Find and delete the rect clicked on
@@ -665,11 +668,13 @@ def open_mask_wizard():
             if dx1 <= e.x <= dx2 and dy1 <= e.y <= dy2:
                 mask_rects.pop(i)
                 redraw()
+                schedule_save()
                 return
 
     def clear_all():
         mask_rects.clear()
         redraw()
+        schedule_save()
 
     canvas.bind("<ButtonPress-1>",   on_press)
     canvas.bind("<B1-Motion>",       on_drag)
@@ -713,6 +718,60 @@ def snap_from_stream():
     enqueue_event(ts_float, ts_str, source="webhook")
 
 # ---------------------------------------------------------------
+# CONFIG PERSISTENCE
+# ---------------------------------------------------------------
+_save_job = None
+
+def save_config(*_):
+    """Write all tunable settings to config.json next to the script."""
+    try:
+        data = {
+            "model":        model_var.get(),
+            "prompt":       prompt_text.get("1.0", tk.END).rstrip("\n"),
+            "snap_before":  snap_before_var.get(),
+            "snap_after":   snap_after_var.get(),
+            "buffer_secs":  buffer_secs_var.get(),
+            "crop_padding": crop_padding_var.get(),
+            "mask_rects":   [list(r) for r in mask_rects],
+        }
+        CONFIG_PATH.write_text(json.dumps(data, indent=2))
+    except Exception as e:
+        print(f"[Config] Save error: {e}")
+
+def schedule_save(*_):
+    """Debounce saves — write 400 ms after the last change."""
+    global _save_job
+    if _save_job:
+        root.after_cancel(_save_job)
+    _save_job = root.after(400, save_config)
+
+def load_config():
+    """Read config.json and apply all stored values to the UI."""
+    if not CONFIG_PATH.exists():
+        return
+    try:
+        data = json.loads(CONFIG_PATH.read_text())
+        if "model" in data:
+            model_var.set(data["model"])
+        if "prompt" in data:
+            prompt_text.delete("1.0", tk.END)
+            prompt_text.insert("1.0", data["prompt"])
+        if "snap_before" in data:
+            snap_before_var.set(data["snap_before"])
+        if "snap_after" in data:
+            snap_after_var.set(data["snap_after"])
+        if "buffer_secs" in data:
+            buffer_secs_var.set(data["buffer_secs"])
+        if "crop_padding" in data:
+            crop_padding_var.set(data["crop_padding"])
+        if "mask_rects" in data:
+            mask_rects.clear()
+            mask_rects.extend(tuple(r) for r in data["mask_rects"])
+        print(f"[Config] Loaded from {CONFIG_PATH}")
+    except Exception as e:
+        print(f"[Config] Load error: {e}")
+
+# ---------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------
 root = tk.Tk()
@@ -726,6 +785,9 @@ snap_before_var   = tk.DoubleVar(value=SNAP_BEFORE_SECS)
 snap_after_var    = tk.DoubleVar(value=SNAP_AFTER_SECS)
 buffer_secs_var   = tk.DoubleVar(value=BUFFER_SECONDS)
 crop_padding_var  = tk.IntVar(value=CROP_PADDING)
+
+for _v in (snap_before_var, snap_after_var, buffer_secs_var, crop_padding_var):
+    _v.trace_add("write", schedule_save)
 
 # Status bar
 status_var = tk.StringVar(value="Starting...")
@@ -757,6 +819,7 @@ model_dropdown = ttk.Combobox(top_bar, textvariable=model_var,
                                font=("Courier New", 10), style="Dark.TCombobox",
                                state="readonly", width=28)
 model_dropdown.pack(side=tk.LEFT)
+model_var.trace_add("write", schedule_save)
 
 tk.Label(top_bar, text=f"💾 {SAVE_DIR}", bg="#0a0a0a", fg="#333333",
          font=("Courier New", 8), padx=12).pack(side=tk.LEFT)
@@ -896,10 +959,14 @@ prompt_text.configure(yscrollcommand=ps.set)
 ps.pack(side=tk.RIGHT, fill=tk.Y)
 prompt_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 prompt_text.insert(tk.END, DEFAULT_PROMPT)
+prompt_text.bind("<KeyRelease>", schedule_save)
+prompt_text.bind("<<Paste>>",    schedule_save)
 
 # ---------------------------------------------------------------
 # START SERVICES
 # ---------------------------------------------------------------
+load_config()   # apply saved settings before threads start
+
 threading.Thread(target=run_flask, daemon=True).start()
 threading.Thread(target=queue_worker, daemon=True).start()
 threading.Thread(target=buffer_worker, daemon=True).start()
