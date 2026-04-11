@@ -1,0 +1,28 @@
+{
+  "model": "minicpm-v:latest",
+  "prompt": "describe in much detail as possible the people, car, or animal in the image. do not describe the surroundsings, the scene, or camera point of view. ",
+  "snap_before": 2.0,
+  "snap_after": 1.5,
+  "buffer_secs": 3.0,
+  "crop_padding": 20,
+  "mask_rects": [
+    [
+      1,
+      1,
+      369,
+      44
+    ],
+    [
+      1016,
+      4,
+      1280,
+      92
+    ],
+    [
+      1150,
+      102,
+      1265,
+      224
+    ]
+  ]
+}

@@ -1,120 +1,136 @@
 import tkinter as tk
 from tkinter import filedialog, ttk
 import threading
-import queue
-import requests
 import base64
 import time
-import os
-import subprocess
-import tempfile
 import collections
 import io
+import json
+import types
+import websocket
 import numpy as np
 import cv2
-from PIL import Image, ImageTk, ImageDraw
-from pathlib import Path
+from PIL import Image, ImageTk
 from datetime import datetime
 from flask import Flask, request
 import logging
 
-# --- Config ---
-OLLAMA_URL = "http://localhost:11434/api/generate"
-DEFAULT_MODEL = "minicpm-v"
-WEBHOOK_PORT = 8765
-SAVE_DIR = Path(os.path.expanduser("~")) / "SecurityEvents"
-SAVE_DIR.mkdir(exist_ok=True)
+from constants import (
+    OLLAMA_URL, DEFAULT_VISION_MODEL, DEFAULT_TEXT_MODEL,
+    CHICAGO_TZ, WEBHOOK_PORT, SAVE_DIR, CONFIG_PATH, RTSP_URL,
+    STREAM_PREVIEW_INTERVAL, BUFFER_SECONDS, FRAME_INTERVAL,
+    SNAP_BEFORE_SECS, SNAP_AFTER_SECS, MIN_BOX_PCT, CROP_PADDING,
+    DEBUG_MODE, DEFAULT_VISION_PROMPT, DEFAULT_TEXT_PROMPT,
+    HA_HOST, HA_TOKEN, WATCHED_ENTITIES, HA_NAMES, HA_GROUPS,
+)
+from priority_queue import NewestFirstQueue
+from motion import jpeg_apply_mask, compute_motion_crop, compute_distance
+from ollama_api import fmt_size, list_models, warmup, analyze_image_bytes, analyze_text
+from synthetic_sensors import SyntheticSensors
+from mask_wizard import open_mask_wizard as _open_mask_wizard
 
-RTSP_URL = "rtsp://192.168.0.166:7447/YD4arutidcyKjQvI"
-STREAM_PREVIEW_INTERVAL = 3000  # ms between live preview refreshes
-
-# Buffer config
-BUFFER_SECONDS = 2.0          # how many seconds of frames to keep
-FRAME_INTERVAL = 0.5          # grab a frame every N seconds for buffer
-SNAP_BACK_SECS = 1.0          # go back this far on webhook
-SNAP_FORWARD_SECS = 0.5       # then grab a frame this far forward
-CROP_PADDING = 50             # px padding around bounding box
-
-DEBUG_MODE = True             # show debug windows
-
-DEFAULT_PROMPT = """You are a security camera analyzer. Look for people, vehicles, and animals ONLY.
-
-For each one found, describe: count, type, appearance, and behavior.
-
-If none are present, respond with only: CLEAR"""
+system_active = threading.Event()
+system_active.set()           # ON by default
 
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 
-analysis_queue = queue.Queue()
+# --- Priority queue for detection events (imported from priority_queue.py) ---
+analysis_queue = NewestFirstQueue()
+
+# State exposed to the queue-detail popup
+_queue_current = None   # item dict currently running, or None
+_queue_stage   = ""     # "diff" | "vision" | "judgment" | ""
 
 # --- Rolling frame buffer: deque of (timestamp, image_bytes) ---
 frame_buffer = collections.deque()
-buffer_lock = threading.Lock()
+buffer_lock  = threading.Lock()
+
+# --- Zone state — mask_rects (list of exclusion rects) and far_zone (distance ref).
+#     Wrapped in a SimpleNamespace so mask_wizard and config can mutate attributes. ---
+cam_state = types.SimpleNamespace(mask_rects=[], far_zone=None)
+
+# Placeholder refs for the distance sensor labels in the HA panel (set during UI build)
+distance_dot_lbl = None
+distance_val_lbl = None
+
+# Model metadata fetched from Ollama at startup: {name: {param_size, size_gb, quantization}}
+_model_info = {}
+# UI label refs for per-model info display (set during UI build)
+vision_model_info_lbl = None
+text_model_info_lbl   = None
+
+# --- Home Assistant live state (populated by ha_worker) ---
+ha_state      = {}          # entity_id -> state string
+ha_row_labels = {}          # entity_id -> {"dot": Label, "val": Label}
+
+# Synthetic sensors — instance created after root exists (see below)
+synth = None
 
 # ---------------------------------------------------------------
 # FRAME BUFFER WORKER
 # Continuously grabs frames via FFmpeg and stores in rolling buffer
 # ---------------------------------------------------------------
-def grab_raw_frame():
-    """Grab one raw JPEG from RTSP. Returns bytes or None."""
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-            tmp_path = tmp.name
-        cmd = [
-            "ffmpeg", "-y",
-            "-rtsp_transport", "tcp",
-            "-stimeout", "5000000",      # 5s socket timeout (microseconds)
-            "-timeout", "5000000",        # 5s connection timeout (microseconds)
-            "-allowed_extensions", "all",
-            "-i", RTSP_URL,
-            "-frames:v", "1",
-            "-q:v", "2",
-            "-f", "image2",
-            tmp_path
-        ]
-        stderr_pipe = None if DEBUG_MODE else subprocess.DEVNULL
-        result = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                                stderr=stderr_pipe, timeout=15)
-        if result.returncode == 0 and Path(tmp_path).exists():
-            data = Path(tmp_path).read_bytes()
-            Path(tmp_path).unlink(missing_ok=True)
-            return data
-        Path(tmp_path).unlink(missing_ok=True)
-        return None
-    except Exception as e:
-        if DEBUG_MODE:
-            print(f"[RTSP] grab_raw_frame error: {e}")
-        return None
-
 def buffer_worker():
-    """Continuously grab frames and maintain rolling buffer."""
+    """Open RTSP stream once with OpenCV and maintain a rolling frame buffer."""
+    cap = None
     _fail_count = 0
+    _last_frame_ts = 0.0
+
     while True:
-        t0 = time.time()
-        data = grab_raw_frame()
-        if data:
+        # (Re)open the capture if needed
+        if cap is None or not cap.isOpened():
+            if cap is not None:
+                cap.release()
+            root.after(0, lambda: stream_status_var.set("⏳ Connecting to stream..."))
+            if DEBUG_MODE:
+                print(f"[RTSP] Opening stream (attempt {_fail_count + 1}): {RTSP_URL}")
+            cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # keep latency low
+            if not cap.isOpened():
+                _fail_count += 1
+                if DEBUG_MODE:
+                    print(f"[RTSP] Could not open stream (attempt {_fail_count})")
+                root.after(0, lambda n=_fail_count: stream_status_var.set(
+                    f"🔴 Disconnected — retrying... (attempt {n})"
+                ))
+                time.sleep(2)
+                continue
             _fail_count = 0
-            ts = time.time()
-            with buffer_lock:
-                frame_buffer.append((ts, data))
-                # Prune frames older than BUFFER_SECONDS
-                cutoff = ts - BUFFER_SECONDS
-                while frame_buffer and frame_buffer[0][0] < cutoff:
-                    frame_buffer.popleft()
-            # Update live preview in UI
-            b64 = base64.b64encode(data).decode()
-            root.after(0, lambda b=b64: update_stream_preview(b))
-        else:
+
+        ret, frame = cap.read()
+        if not ret:
             _fail_count += 1
             if DEBUG_MODE:
-                print(f"[RTSP] Frame grab failed (attempt {_fail_count}) — {RTSP_URL}")
+                print(f"[RTSP] Read failed — reconnecting (attempt {_fail_count})")
             root.after(0, lambda n=_fail_count: stream_status_var.set(
-                f"🔴 Disconnected — retrying... (attempt {n})"
+                f"🔴 Stream lost — reconnecting... (attempt {n})"
             ))
-        elapsed = time.time() - t0
-        sleep = max(0, FRAME_INTERVAL - elapsed)
-        time.sleep(sleep)
+            cap.release()
+            cap = None
+            time.sleep(1)
+            continue
+
+        _fail_count = 0
+        now = time.time()
+
+        # Throttle: only store a frame every FRAME_INTERVAL seconds
+        if now - _last_frame_ts < FRAME_INTERVAL:
+            continue
+        _last_frame_ts = now
+
+        # Encode to JPEG bytes and store in buffer
+        _, enc = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        data = enc.tobytes()
+
+        with buffer_lock:
+            frame_buffer.append((now, data))
+            cutoff = now - buffer_secs_var.get()
+            while frame_buffer and frame_buffer[0][0] < cutoff:
+                frame_buffer.popleft()
+
+        b64 = base64.b64encode(data).decode()
+        root.after(0, lambda b=b64: update_stream_preview(b))
 
 def get_frame_at(target_ts):
     """Get the buffered frame closest to target_ts. Returns bytes or None."""
@@ -124,106 +140,19 @@ def get_frame_at(target_ts):
         best = min(frame_buffer, key=lambda x: abs(x[0] - target_ts))
         return best[1]
 
-# ---------------------------------------------------------------
-# MOTION DETECTION & BOUNDING BOX
-# ---------------------------------------------------------------
-def compute_motion_crop(frame_a_bytes, frame_b_bytes):
-    """
-    Diff two JPEG frames. Returns:
-      - cropped_bytes: JPEG of the motion crop from frame_b
-      - debug_images: dict of labeled PIL images for debug view
-      - bbox: (x1, y1, x2, y2) or None
-    """
-    # Decode to numpy
-    arr_a = np.frombuffer(frame_a_bytes, dtype=np.uint8)
-    arr_b = np.frombuffer(frame_b_bytes, dtype=np.uint8)
-    img_a = cv2.imdecode(arr_a, cv2.IMREAD_COLOR)
-    img_b = cv2.imdecode(arr_b, cv2.IMREAD_COLOR)
-
-    if img_a is None or img_b is None:
-        return None, {}, None
-
-    # Resize to same size if different (shouldn't happen but safety)
-    if img_a.shape != img_b.shape:
-        img_b = cv2.resize(img_b, (img_a.shape[1], img_a.shape[0]))
-
-    h, w = img_a.shape[:2]
-
-    # Grayscale
-    gray_a = cv2.cvtColor(img_a, cv2.COLOR_BGR2GRAY)
-    gray_b = cv2.cvtColor(img_b, cv2.COLOR_BGR2GRAY)
-
-    # Gaussian blur to reduce noise
-    blur_a = cv2.GaussianBlur(gray_a, (21, 21), 0)
-    blur_b = cv2.GaussianBlur(gray_b, (21, 21), 0)
-
-    # Absolute diff
-    diff = cv2.absdiff(blur_a, blur_b)
-
-    # Threshold
-    _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
-
-    # Dilate to fill gaps
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    dilated = cv2.dilate(thresh, kernel, iterations=2)
-
-    # Find contours
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    # Filter small noise contours (< 0.05% of frame area)
-    min_area = w * h * 0.0005
-    contours = [c for c in contours if cv2.contourArea(c) > min_area]
-
-    bbox = None
-    cropped_bytes = None
-
-    if contours:
-        # Bounding box enclosing all motion contours
-        x1 = min(cv2.boundingRect(c)[0] for c in contours)
-        y1 = min(cv2.boundingRect(c)[1] for c in contours)
-        x2 = max(cv2.boundingRect(c)[0] + cv2.boundingRect(c)[2] for c in contours)
-        y2 = max(cv2.boundingRect(c)[1] + cv2.boundingRect(c)[3] for c in contours)
-
-        # Add padding, clamp to frame
-        x1p = max(0, x1 - CROP_PADDING)
-        y1p = max(0, y1 - CROP_PADDING)
-        x2p = min(w, x2 + CROP_PADDING)
-        y2p = min(h, y2 + CROP_PADDING)
-        bbox = (x1p, y1p, x2p, y2p)
-
-        # Crop from frame_b
-        crop = img_b[y1p:y2p, x1p:x2p]
-        _, crop_enc = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
-        cropped_bytes = crop_enc.tobytes()
-
-    # --- Debug images ---
-    debug = {}
-
-    def cv2_to_pil(img, gray=False):
-        if gray:
-            return Image.fromarray(img)
-        return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-
-    debug["Frame A\n(t-1s)"] = cv2_to_pil(img_a)
-    debug["Frame B\n(t+0.5s)"] = cv2_to_pil(img_b)
-    debug["Diff"] = cv2_to_pil(diff, gray=True)
-    debug["Threshold"] = cv2_to_pil(thresh, gray=True)
-    debug["Dilated\nmask"] = cv2_to_pil(dilated, gray=True)
-
-    # Draw bounding box on frame B copy
-    img_b_annot = img_b.copy()
-    if bbox:
-        x1p, y1p, x2p, y2p = bbox
-        cv2.rectangle(img_b_annot, (x1p, y1p), (x2p, y2p), (0, 255, 0), 3)
-        # Draw all contours in red
-        cv2.drawContours(img_b_annot, contours, -1, (0, 0, 255), 2)
-    debug["Bounding\nbox"] = cv2_to_pil(img_b_annot)
-
-    if cropped_bytes:
-        crop_pil = Image.open(io.BytesIO(cropped_bytes))
-        debug["AI\nCrop"] = crop_pil
-
-    return cropped_bytes, debug, bbox
+def _update_distance_display(distance):
+    """Update the distance sensor row in the HA panel (must run on main thread)."""
+    if distance_dot_lbl is None:
+        return
+    is_close = "closer" in distance
+    distance_dot_lbl.config(
+        text="●" if is_close else "○",
+        fg="#ff8800" if is_close else "#00ff88"
+    )
+    distance_val_lbl.config(
+        text="close  <15ft" if is_close else "far  >15ft",
+        fg="#ff8800" if is_close else "#00ff88"
+    )
 
 # ---------------------------------------------------------------
 # DEBUG WINDOW
@@ -297,164 +226,389 @@ def save_event_background(frame_a, frame_b, cropped, description, bbox, ts):
 # ---------------------------------------------------------------
 # OLLAMA
 # ---------------------------------------------------------------
+def _update_model_info_labels(*_):
+    """Refresh the per-model info labels in the Master tab after a selection change."""
+    for var, lbl in [(vision_model_var, vision_model_info_lbl),
+                     (text_model_var,   text_model_info_lbl)]:
+        if lbl is None:
+            continue
+        info = _model_info.get(var.get(), {})
+        if info:
+            parts = []
+            if info.get("param_size"):
+                parts.append(info["param_size"])
+            if info.get("size_gb", 0) > 0:
+                parts.append(fmt_size(info["size_gb"]))
+            if info.get("quantization"):
+                parts.append(info["quantization"])
+            if info.get("family"):
+                parts.append(info["family"])
+            lbl.config(text="  ·  ".join(parts) if parts else "—")
+        else:
+            lbl.config(text="—")
+
 def fetch_models():
+    global _model_info
     try:
-        resp = requests.get("http://localhost:11434/api/tags", timeout=10)
-        resp.raise_for_status()
-        models = [m["name"] for m in resp.json().get("models", [])]
-        if models:
-            model_dropdown["values"] = models
-            if "minicpm-v" in models:
-                model_var.set("minicpm-v")
-            else:
-                model_var.set(models[0])
+        _model_info.clear()
+        _model_info.update(list_models())
+
+        model_names = list(_model_info.keys())
+        print(f"[Models] {len(model_names)} available:")
+        for n in model_names:
+            i = _model_info[n]
+            print(f"  {n:<40}  {i['param_size']:<6}  {fmt_size(i['size_gb']):<10}  {i['quantization']}")
+
+        if model_names:
+            vision_model_dropdown["values"] = model_names
+            text_model_dropdown["values"]   = model_names
+            # Default vision model to minicpm-v if present, else keep current or use first
+            if vision_model_var.get() not in model_names:
+                if "minicpm-v:latest" in model_names:
+                    vision_model_var.set("minicpm-v:latest")
+                elif any("minicpm-v" in m for m in model_names):
+                    vision_model_var.set(next(m for m in model_names if "minicpm-v" in m))
+                else:
+                    vision_model_var.set(model_names[0])
+            if text_model_var.get() not in model_names:
+                text_model_var.set(model_names[0])
+
+            root.after(0, _update_model_info_labels)
+
     except Exception as e:
-        status_var.set(f"⚠️ Could not fetch models: {e}")
+        root.after(0, lambda: status_var.set(f"⚠️ Could not fetch models: {e}"))
 
 def warmup_model():
     status_var.set("⏳ Loading models...")
     fetch_models()
     try:
-        requests.post(OLLAMA_URL, json={
-            "model": model_var.get(),
-            "prompt": "ready",
-            "stream": False,
-            "keep_alive": -1
-        }, timeout=60)
+        for m in {vision_model_var.get(), text_model_var.get()}:
+            warmup(m)
         update_queue_status()
     except Exception as e:
         status_var.set(f"⚠️ Warmup failed: {e}")
 
-def analyze_image_bytes(image_bytes, prompt, model):
-    image_b64 = base64.b64encode(image_bytes).decode()
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "images": [image_b64],
-        "stream": False,
-        "keep_alive": -1
-    }
-    response = requests.post(OLLAMA_URL, json=payload, timeout=120)
-    response.raise_for_status()
-    return response.json().get("response", "No response received.")
+def build_ha_context():
+    """Format current HA state into a readable string for the text model."""
+    lines = []
+    # Synthetic sensors first
+    child, jacob, lauren, emerg = synth.get_state()
+    lines.append(
+        f"SYNTHETIC SENSORS: "
+        f"child_detected={'on' if child else 'off'}, "
+        f"jacob_detected={'on' if jacob else 'off'}, "
+        f"lauren_detected={'on' if lauren else 'off'}, "
+        f"emergency_child_alone={'on' if emerg else 'off'}"
+    )
+    for group_name, entities in HA_GROUPS:
+        parts = [f"{HA_NAMES.get(e, e)}={ha_state.get(e, 'unknown')}" for e in entities]
+        lines.append(f"{group_name}: {', '.join(parts)}")
+    return "\n".join(lines)
 
 def update_queue_status():
-    qsize = analysis_queue.qsize()
+    qsize    = analysis_queue.qsize()
     buf_size = len(frame_buffer)
-    if qsize > 0:
-        status_var.set(f"✅ Ready — webhook :{WEBHOOK_PORT} — 📋 {qsize} queued — 🎞 {buf_size} frames buffered")
+    processing = _queue_current is not None
+    if qsize > 0 or processing:
+        status_var.set(f"✅ Ready — webhook :{WEBHOOK_PORT} — 📋 {qsize} waiting — 🎞 {buf_size} frames buffered")
     else:
         status_var.set(f"✅ Ready — webhook :{WEBHOOK_PORT} — 🎞 {buf_size} frames buffered")
+
+# UI ref for the queue badge button in Master tab (set during UI build)
+_queue_badge_var = None
+
+def _refresh_queue_badge(*_):
+    """Update the clickable queue badge at the top of the Master tab."""
+    if _queue_badge_var is None:
+        return
+    qsize   = analysis_queue.qsize()
+    current = _queue_current
+    stage   = _queue_stage
+    stage_label = {"diff": "diffing", "vision": "vision model",
+                   "judgment": "judgment model"}.get(stage, "processing")
+
+    if current is None and qsize == 0:
+        _queue_badge_var.set("  ● IDLE  —  click for queue detail")
+        try: queue_badge.config(fg="#333333")
+        except Exception: pass
+    elif current is not None and qsize == 0:
+        _queue_badge_var.set(f"  ⏳ {stage_label}  —  nothing waiting")
+        try: queue_badge.config(fg="#00aaff")
+        except Exception: pass
+    else:
+        _queue_badge_var.set(f"  ⏳ {stage_label}  —  📋 {qsize} waiting  (click for detail)")
+        try: queue_badge.config(fg="#ffaa00")
+        except Exception: pass
+
+_queue_win = None
+
+def open_queue_window():
+    global _queue_win
+    if _queue_win and _queue_win.winfo_exists():
+        _queue_win.lift()
+        return
+
+    _queue_win = tk.Toplevel(root)
+    _queue_win.title("Detection Queue")
+    _queue_win.configure(bg="#0a0a0a")
+    _queue_win.geometry("520x420")
+    _queue_win.resizable(True, True)
+
+    # --- CURRENTLY PROCESSING ---
+    tk.Label(_queue_win, text="PROCESSING", bg="#0a0a0a", fg="#444444",
+             font=("Courier New", 8, "bold"), anchor="w", padx=14).pack(fill=tk.X, pady=(14, 4))
+
+    curr_frame = tk.Frame(_queue_win, bg="#111111")
+    curr_frame.pack(fill=tk.X, padx=14, pady=(0, 8))
+    curr_dot  = tk.Label(curr_frame, text="○", bg="#111111", fg="#333333",
+                          font=("Courier New", 11, "bold"), padx=8)
+    curr_dot.pack(side=tk.LEFT)
+    curr_lbl  = tk.Label(curr_frame, text="idle", bg="#111111", fg="#555555",
+                          font=("Courier New", 10), anchor="w", pady=6)
+    curr_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+    curr_stage = tk.Label(curr_frame, text="", bg="#111111", fg="#00aaff",
+                           font=("Courier New", 9, "bold"), padx=8)
+    curr_stage.pack(side=tk.RIGHT)
+
+    # --- WAITING ---
+    tk.Label(_queue_win, text="WAITING  (newest first)", bg="#0a0a0a", fg="#444444",
+             font=("Courier New", 8, "bold"), anchor="w", padx=14).pack(fill=tk.X, pady=(4, 4))
+
+    list_frame = tk.Frame(_queue_win, bg="#0a0a0a")
+    list_frame.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 14))
+    list_text = tk.Text(list_frame, bg="#111111", fg="#555555",
+                        font=("Courier New", 9), relief=tk.FLAT,
+                        padx=10, pady=8, wrap=tk.WORD, state=tk.DISABLED,
+                        selectbackground="#003322")
+    list_scroll = tk.Scrollbar(list_frame, command=list_text.yview, bg="#111111")
+    list_text.configure(yscrollcommand=list_scroll.set)
+    list_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+    list_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    stage_names = {"diff": "🔬 motion diff", "vision": "👁 vision model",
+                   "judgment": "🧠 judgment model"}
+
+    def _refresh_win():
+        if not _queue_win.winfo_exists():
+            return
+        # Currently processing
+        cur = _queue_current
+        if cur:
+            ts   = cur.get("ts_str", "—")
+            src  = cur.get("source", "webhook")
+            curr_dot.config(text="●", fg="#00ff88")
+            curr_lbl.config(text=f"{ts}  [{src}]", fg="#e0e0e0")
+            curr_stage.config(text=stage_names.get(_queue_stage, _queue_stage))
+        else:
+            curr_dot.config(text="○", fg="#333333")
+            curr_lbl.config(text="idle", fg="#555555")
+            curr_stage.config(text="")
+        # Waiting items
+        waiting = analysis_queue.peek_all()
+        list_text.config(state=tk.NORMAL)
+        list_text.delete("1.0", tk.END)
+        if not waiting:
+            list_text.insert(tk.END, "— queue empty —")
+        else:
+            for i, it in enumerate(waiting, 1):
+                ts  = it.get("ts_str", "—")
+                src = it.get("source", "webhook")
+                list_text.insert(tk.END, f"  {i}.  {ts}  [{src}]\n")
+        list_text.config(state=tk.DISABLED)
+        _queue_win.after(400, _refresh_win)
+
+    _refresh_win()
 
 # ---------------------------------------------------------------
 # QUEUE WORKER
 # ---------------------------------------------------------------
+def _set_stage(stage, ts_str=""):
+    global _queue_stage
+    _queue_stage = stage
+    root.after(0, _refresh_queue_badge)
+    label = {"diff": "🔬 Motion diff", "vision": "👁 Vision",
+             "judgment": "🧠 Judgment"}.get(stage, "📡 Processing")
+    root.after(0, lambda l=label, t=ts_str: status_var.set(
+        f"{l} [{t}]" + (f" — {analysis_queue.qsize()} waiting" if analysis_queue.qsize() else "")))
+
 def queue_worker():
+    global _queue_current, _queue_stage
     while True:
         item = analysis_queue.get()
+        _queue_current = item
+        root.after(0, _refresh_queue_badge)
         try:
-            trigger_ts = item["trigger_ts"]   # float epoch time of webhook
-            ts_str = item["ts_str"]
-            model = item["model"]
-            prompt = item["prompt"]
-            source = item.get("source", "webhook")
-
-            root.after(0, lambda t=ts_str: status_var.set(f"📡 Processing event [{t}]"))
+            ts_str        = item["ts_str"]
+            vision_model  = item["vision_model"]
+            text_model    = item["text_model"]
+            vision_prompt = item["vision_prompt"]
+            text_prompt   = item["text_prompt"]
+            source        = item.get("source", "webhook")
 
             if source == "manual":
-                # Manual browse — skip motion detection, send image directly
                 image_bytes = base64.b64decode(item["image_b64"])
+                _set_stage("vision", ts_str)
                 t0 = time.time()
-                result = analyze_image_bytes(image_bytes, prompt, model)
+                vision_result = analyze_image_bytes(image_bytes, vision_prompt, vision_model)
+                synth.check(vision_result)
+
+                _set_stage("judgment", ts_str)
+                chicago_now = datetime.now(CHICAGO_TZ).strftime("%A %B %d %Y  %I:%M:%S %p %Z")
+                full_text_prompt = (
+                    f"{text_prompt}\n\n"
+                    f"Time: {chicago_now}\n\n"
+                    f"Home state:\n{build_ha_context()}\n\n"
+                    f"Visual observation:\n{vision_result}"
+                )
+                text_result = analyze_text(full_text_prompt, text_model)
                 elapsed = time.time() - t0
+
                 _b = item["image_b64"]
-                root.after(0, lambda b=_b, r=result, t=ts_str, e=elapsed:
-                           finish_analysis(b, r, t, e))
-                save_event_background(None, None, image_bytes, result, None, ts_str)
+                _ti = full_text_prompt
+                root.after(0, lambda b=_b, vr=vision_result, ti=_ti, tr=text_result, t=ts_str, e=elapsed:
+                           finish_analysis(b, vr, ti, tr, t, e))
+                save_event_background(None, None, image_bytes, text_result, None, ts_str)
                 continue
 
-            # --- Get frame A: 1s BEFORE webhook ---
-            ts_a = trigger_ts - SNAP_BACK_SECS
-            frame_a = get_frame_at(ts_a)
-
-            # --- Get frame B: 0.5s AFTER webhook ---
-            # Wait briefly to let buffer catch up
-            time.sleep(SNAP_FORWARD_SECS + 0.2)
-            ts_b = trigger_ts + SNAP_FORWARD_SECS
-            frame_b = get_frame_at(ts_b)
+            # --- Use pre-captured frames (grabbed at enqueue time) ---
+            frame_a = item.get("frame_a")
+            frame_b = item.get("frame_b")
 
             if frame_a is None or frame_b is None:
                 root.after(0, lambda t=ts_str: status_var.set(
-                    f"⚠️ [{t}] Buffer miss — not enough frames yet"))
+                    f"⚠️ [{t}] No frames captured at trigger time"))
                 continue
 
-            root.after(0, lambda t=ts_str: status_var.set(f"🔬 Computing motion diff [{t}]"))
+            _set_stage("diff", ts_str)
+            cropped_bytes, debug_imgs, bbox = compute_motion_crop(
+                frame_a, frame_b, min_box_pct_var.get(), crop_padding_var.get()
+            )
 
-            # --- Motion diff + crop ---
-            cropped_bytes, debug_imgs, bbox = compute_motion_crop(frame_a, frame_b)
-
-            # Show debug window
             if debug_imgs:
                 root.after(0, lambda d=debug_imgs: show_debug_window(d))
-
             if cropped_bytes is None:
-                # No motion detected — use full frame B
                 root.after(0, lambda t=ts_str: status_var.set(
-                    f"⚠️ [{t}] No motion detected — using full frame"))
+                    f"⚠️ [{t}] No motion — using full frame"))
                 cropped_bytes = frame_b
 
-            # Show crop in detected panel
             crop_b64 = base64.b64encode(cropped_bytes).decode()
             root.after(0, lambda b=crop_b64: show_detected_image(b))
 
-            # --- Analyze ---
-            qsize = analysis_queue.qsize()
-            root.after(0, lambda q=qsize, t=ts_str: status_var.set(
-                f"🔍 Analyzing [{t}]" + (f" — {q} more queued" if q > 0 else "")
-            ))
+            distance = compute_distance(bbox, cam_state.far_zone)
+            if distance:
+                root.after(0, lambda d=distance: _update_distance_display(d))
 
+            _set_stage("vision", ts_str)
             t0 = time.time()
-            result = analyze_image_bytes(cropped_bytes, prompt, model)
+            vision_result = analyze_image_bytes(cropped_bytes, vision_prompt, vision_model)
+            synth.check(vision_result)
+
+            _set_stage("judgment", ts_str)
+            chicago_now = datetime.now(CHICAGO_TZ).strftime("%A %B %d %Y  %I:%M:%S %p %Z")
+            distance_line = f"\nDistance from house: {distance}" if distance else ""
+            full_text_prompt = (
+                f"{text_prompt}\n\n"
+                f"Time: {chicago_now}\n\n"
+                f"Home state:\n{build_ha_context()}{distance_line}\n\n"
+                f"Visual observation:\n{vision_result}"
+            )
+            text_result = analyze_text(full_text_prompt, text_model)
             elapsed = time.time() - t0
 
             _b64 = crop_b64
-            root.after(0, lambda b=_b64, r=result, t=ts_str, e=elapsed:
-                       finish_analysis(b, r, t, e))
+            _ti  = full_text_prompt
+            root.after(0, lambda b=_b64, vr=vision_result, ti=_ti, tr=text_result, t=ts_str, e=elapsed:
+                       finish_analysis(b, vr, ti, tr, t, e))
 
-            save_event_background(frame_a, frame_b, cropped_bytes, result, bbox, ts_str)
+            save_event_background(frame_a, frame_b, cropped_bytes,
+                                  f"VISION:\n{vision_result}\n\nJUDGMENT:\n{text_result}",
+                                  bbox, ts_str)
 
         except Exception as e:
             import traceback
             traceback.print_exc()
             root.after(0, lambda err=str(e): status_var.set(f"⚠️ Error: {err}"))
         finally:
+            _queue_current = None
+            _queue_stage   = ""
             analysis_queue.task_done()
+            root.after(0, _refresh_queue_badge)
             root.after(0, update_queue_status)
 
-def finish_analysis(image_b64, result, ts, elapsed):
+def finish_analysis(image_b64, vision_result, text_input, text_result, ts, elapsed):
     timer_var.set(f"⏱  {elapsed:.2f}s")
     show_detected_image(image_b64)
+
+    # --- Camera tab output ---
     output_text.config(state=tk.NORMAL)
     output_text.delete("1.0", tk.END)
-    output_text.insert(tk.END, result)
+    output_text.tag_configure("dim",   foreground="#555555", font=("Courier New", 9))
+    output_text.tag_configure("label", foreground="#444444", font=("Courier New", 8, "bold"))
+    output_text.tag_configure("main",  foreground="#e0e0e0", font=("Courier New", 11))
+    output_text.insert(tk.END, "👁  VISION\n", "label")
+    output_text.insert(tk.END, vision_result + "\n\n", "dim")
+    output_text.insert(tk.END, "🧠  JUDGMENT\n", "label")
+    output_text.insert(tk.END, text_result, "main")
     output_text.config(state=tk.DISABLED)
+
+    # --- Master tab detection panel ---
+    try:
+        img_data = base64.b64decode(image_b64)
+        img = Image.open(io.BytesIO(img_data))
+        img.thumbnail((220, 150), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(img)
+        master_detected_label.config(image=photo, text="", width=img.width, height=img.height)
+        master_detected_label.image = photo
+    except Exception:
+        pass
+
+    def _set_text(widget, content):
+        widget.config(state=tk.NORMAL)
+        widget.delete("1.0", tk.END)
+        widget.insert(tk.END, content)
+        widget.config(state=tk.DISABLED)
+
+    _set_text(master_vision_text, vision_result)
+    _set_text(master_input_text,  text_input)
+    _set_text(master_result_text, text_result)
+
     update_queue_status()
 
 def enqueue_event(ts_float, ts_str, source="webhook", image_b64=None):
-    model = model_var.get()
-    prompt = prompt_text.get("1.0", tk.END).strip()
+    """
+    Capture frames from the rolling buffer RIGHT NOW (before they can roll off),
+    then add the item to the priority queue for processing.
+    """
+    # --- Capture frames immediately so buffer-rolloff can't lose them ---
+    frame_a = None
+    frame_b = None
+    if source == "webhook":
+        ts_a = ts_float - snap_before_var.get()
+        ts_b = ts_float - snap_after_var.get()
+        frame_a = get_frame_at(ts_a)
+        frame_b = get_frame_at(ts_b)
+        if frame_a and cam_state.mask_rects:
+            frame_a = jpeg_apply_mask(frame_a, cam_state.mask_rects)
+        if frame_b and cam_state.mask_rects:
+            frame_b = jpeg_apply_mask(frame_b, cam_state.mask_rects)
+
     item = {
-        "trigger_ts": ts_float,
-        "ts_str": ts_str,
-        "model": model,
-        "prompt": prompt,
-        "source": source,
+        "trigger_ts":    ts_float,
+        "ts_str":        ts_str,
+        "vision_model":  vision_model_var.get(),
+        "text_model":    text_model_var.get(),
+        "vision_prompt": vision_prompt_text.get("1.0", tk.END).strip(),
+        "text_prompt":   text_prompt_text.get("1.0", tk.END).strip(),
+        "source":        source,
+        "frame_a":       frame_a,   # pre-captured (may be None for manual)
+        "frame_b":       frame_b,
+        "enqueued_at":   ts_float,
     }
     if image_b64:
         item["image_b64"] = image_b64
-    analysis_queue.put(item)
-    qsize = analysis_queue.qsize()
-    root.after(0, lambda q=qsize: status_var.set(f"📋 Event queued — {q} in queue"))
+
+    analysis_queue.put(item, ts_float)
+    root.after(0, _refresh_queue_badge)
 
 def show_detected_image(image_b64):
     try:
@@ -471,7 +625,7 @@ def update_stream_preview(image_b64):
     try:
         img_data = base64.b64decode(image_b64)
         img = Image.open(io.BytesIO(img_data))
-        img.thumbnail((320, 180), Image.LANCZOS)
+        img.thumbnail((640, 360), Image.LANCZOS)
         photo = ImageTk.PhotoImage(img)
         stream_label.config(image=photo, text="")
         stream_label.image = photo
@@ -480,29 +634,136 @@ def update_stream_preview(image_b64):
         stream_status_var.set("⚠️ Preview error")
 
 # ---------------------------------------------------------------
+# HOME ASSISTANT WEBSOCKET WORKER
+# ---------------------------------------------------------------
+def _ha_is_active(state):
+    return state in ("on", "open", "unlocked", "detected", "playing", "home", "true")
+
+def _ha_apply_entity(entity_id, state):
+    """Update dict + UI labels for one entity (call via root.after on main thread)."""
+    ha_state[entity_id] = state
+    if entity_id not in ha_row_labels:
+        return
+    row = ha_row_labels[entity_id]
+    active = _ha_is_active(state)
+    row["dot"].config(text="●" if active else "○",
+                      fg="#00ff88" if active else "#444444")
+    row["val"].config(text=state,
+                      fg="#00ff88" if active else "#666666")
+
+def ha_worker():
+    while True:
+        try:
+            ws = websocket.create_connection(
+                f"ws://{HA_HOST}:8123/api/websocket",
+                timeout=15
+            )
+            root.after(0, lambda: ha_status_var.set("⟳  Authenticating..."))
+
+            # 1. auth_required → send token
+            msg = json.loads(ws.recv())
+            assert msg.get("type") == "auth_required", f"Expected auth_required, got {msg}"
+            ws.send(json.dumps({"type": "auth", "access_token": HA_TOKEN}))
+
+            # 2. auth_ok
+            msg = json.loads(ws.recv())
+            assert msg.get("type") == "auth_ok", f"Auth failed: {msg}"
+            root.after(0, lambda: ha_status_var.set("⟳  Fetching states..."))
+
+            # 3. get_states
+            ws.send(json.dumps({"id": 1, "type": "get_states"}))
+
+            # 4. subscribe to state_changed
+            ws.send(json.dumps({"id": 2, "type": "subscribe_events",
+                                "event_type": "state_changed"}))
+
+            # 5. process messages indefinitely
+            while True:
+                raw = ws.recv()
+                msg = json.loads(raw)
+
+                if msg.get("id") == 1 and msg.get("type") == "result":
+                    # Initial state dump
+                    for s in msg.get("result", []):
+                        eid = s.get("entity_id", "")
+                        if eid in WATCHED_ENTITIES:
+                            state = s.get("state", "unknown")
+                            root.after(0, lambda e=eid, st=state: _ha_apply_entity(e, st))
+                    root.after(0, lambda: ha_status_var.set("● Connected"))
+                    print("[HA] Initial states loaded")
+
+                elif msg.get("type") == "event":
+                    edata = msg.get("event", {}).get("data", {})
+                    eid   = edata.get("entity_id", "")
+                    if eid in WATCHED_ENTITIES:
+                        state = (edata.get("new_state") or {}).get("state", "unknown")
+                        root.after(0, lambda e=eid, st=state: _ha_apply_entity(e, st))
+                        print(f"[HA] {eid} → {state}")
+
+        except Exception as e:
+            print(f"[HA] Disconnected: {e} — retrying in 10s")
+            root.after(0, lambda: ha_status_var.set("○ Disconnected — retrying..."))
+            try:
+                ws.close()
+            except Exception:
+                pass
+            time.sleep(10)
+
+# ---------------------------------------------------------------
 # FLASK WEBHOOK
 # ---------------------------------------------------------------
 flask_app = Flask(__name__)
 
 @flask_app.route("/event", methods=["POST"])
 def event():
+    if not system_active.is_set():
+        print("[Webhook] System is OFF — ignoring event")
+        return "INACTIVE", 200
     try:
-        data = request.get_json(force=True)
+        raw = request.get_data(as_text=True)
+        data = request.get_json(force=True) or {}
+
+        ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"\n[Webhook] {ts_str} — incoming POST to /event")
+        print(f"[Webhook] payload: {raw[:500]}")
+
         alarm = data.get("alarm", {})
         triggers = alarm.get("triggers", [])
         trigger_key = triggers[0].get("key", "unknown") if triggers else "unknown"
-        if trigger_key != "line_crossed":
+        print(f"[Webhook] trigger_key={trigger_key!r}")
+
+        # Route by camera ID — search raw payload for each tab's configured ID
+        raw_upper = raw.upper()
+        configured_id = cam_id_var.get().strip().upper()
+        cam_name = cam_name_var.get() or "Camera"
+
+        if configured_id and configured_id in raw_upper:
+            print(f"[Webhook] MATCHED camera '{cam_name}' (ID={configured_id}) — queuing analysis")
+            ts_float = time.time()
+            enqueue_event(ts_float, ts_str, source="webhook")
+            return "OK", 200
+        else:
+            print(f"[Webhook] SKIPPED — no matching camera ID found in payload "
+                  f"(configured={configured_id!r})")
+            root.after(0, lambda: status_var.set(
+                f"Webhook received — no camera ID match (configured={configured_id!r})"
+            ))
             return "SKIP", 200
-        ts_float = time.time()
-        ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        enqueue_event(ts_float, ts_str, source="webhook")
-        return "OK", 200
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"[Webhook error] {e}")
         return "ERROR", 500
 
 def run_flask():
     flask_app.run(host="0.0.0.0", port=WEBHOOK_PORT, debug=False, use_reloader=False)
+
+# ---------------------------------------------------------------
+# AREA RESTRICTOR WIZARD (implementation in mask_wizard.py)
+# ---------------------------------------------------------------
+def open_mask_wizard():
+    _open_mask_wizard(root, cam_state, frame_buffer, buffer_lock,
+                      status_var, schedule_save)
 
 # ---------------------------------------------------------------
 # MANUAL BROWSE
@@ -526,53 +787,164 @@ def snap_from_stream():
     enqueue_event(ts_float, ts_str, source="webhook")
 
 # ---------------------------------------------------------------
+# CONFIG PERSISTENCE
+# ---------------------------------------------------------------
+_save_job = None
+
+def save_config(*_):
+    """Write all tunable settings to config.json."""
+    try:
+        data = {
+            "vision_model":    vision_model_var.get(),
+            "text_model":      text_model_var.get(),
+            "vision_prompt":   vision_prompt_text.get("1.0", tk.END).rstrip("\n"),
+            "text_prompt":     text_prompt_text.get("1.0", tk.END).rstrip("\n"),
+            "snap_before":     snap_before_var.get(),
+            "snap_after":      snap_after_var.get(),
+            "buffer_secs":     buffer_secs_var.get(),
+            "crop_padding":    crop_padding_var.get(),
+            "min_box_pct":     min_box_pct_var.get(),
+            "cam_name":        cam_name_var.get(),
+            "cam_id":          cam_id_var.get(),
+            "system_active":   system_active_var.get(),
+            "mask_rects":      [list(r) for r in cam_state.mask_rects],
+            "far_zone":        list(cam_state.far_zone) if cam_state.far_zone else None,
+        }
+        CONFIG_PATH.write_text(json.dumps(data, indent=2))
+    except Exception as e:
+        print(f"[Config] Save error: {e}")
+
+def schedule_save(*_):
+    """Debounce saves — write 400 ms after the last change."""
+    global _save_job
+    if _save_job:
+        root.after_cancel(_save_job)
+    _save_job = root.after(400, save_config)
+
+def load_config():
+    """Read config.json and apply all stored values to the UI."""
+    if not CONFIG_PATH.exists():
+        return
+    try:
+        data = json.loads(CONFIG_PATH.read_text())
+        if "vision_model" in data:
+            vision_model_var.set(data["vision_model"])
+        if "text_model" in data:
+            text_model_var.set(data["text_model"])
+        if "vision_prompt" in data:
+            vision_prompt_text.delete("1.0", tk.END)
+            vision_prompt_text.insert("1.0", data["vision_prompt"])
+        if "text_prompt" in data:
+            text_prompt_text.delete("1.0", tk.END)
+            text_prompt_text.insert("1.0", data["text_prompt"])
+        if "snap_before" in data:
+            snap_before_var.set(data["snap_before"])
+        if "snap_after" in data:
+            snap_after_var.set(data["snap_after"])
+        if "buffer_secs" in data:
+            buffer_secs_var.set(data["buffer_secs"])
+        if "crop_padding" in data:
+            crop_padding_var.set(data["crop_padding"])
+        if "min_box_pct" in data:
+            min_box_pct_var.set(data["min_box_pct"])
+        if "cam_name" in data:
+            cam_name_var.set(data["cam_name"])
+        if "cam_id" in data:
+            cam_id_var.set(data["cam_id"])
+        if "system_active" in data:
+            system_active_var.set(data["system_active"])
+        if "mask_rects" in data:
+            cam_state.mask_rects.clear()
+            cam_state.mask_rects.extend(tuple(r) for r in data["mask_rects"])
+        if "far_zone" in data and data["far_zone"]:
+            cam_state.far_zone = tuple(data["far_zone"])
+        print(f"[Config] Loaded from {CONFIG_PATH}")
+    except Exception as e:
+        print(f"[Config] Load error: {e}")
+
+# ---------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------
 root = tk.Tk()
 root.title("Security Vision — Preston" + (" [DEBUG]" if DEBUG_MODE else ""))
-root.geometry("860x760")
+root.geometry("1200x900")
 root.configure(bg="#0a0a0a")
 root.resizable(True, True)
 
-# Status bar
+# Force combobox dropdown list to use black text on white background (Windows fix)
+root.option_add("*TCombobox*Listbox.background",       "#ffffff")
+root.option_add("*TCombobox*Listbox.foreground",       "#000000")
+root.option_add("*TCombobox*Listbox.selectBackground", "#cceecc")
+root.option_add("*TCombobox*Listbox.selectForeground", "#000000")
+
+# Synthetic sensor manager (UI label refs wired in after HA panel is built)
+synth = SyntheticSensors(root, ha_state)
+
+# --- All tunable vars ---
+snap_before_var   = tk.DoubleVar(value=SNAP_BEFORE_SECS)
+snap_after_var    = tk.DoubleVar(value=SNAP_AFTER_SECS)
+buffer_secs_var   = tk.DoubleVar(value=BUFFER_SECONDS)
+crop_padding_var  = tk.IntVar(value=CROP_PADDING)
+min_box_pct_var   = tk.DoubleVar(value=MIN_BOX_PCT)
+vision_model_var  = tk.StringVar(value=DEFAULT_VISION_MODEL)
+text_model_var    = tk.StringVar(value=DEFAULT_TEXT_MODEL)
+cam_name_var      = tk.StringVar(value="Front Door")
+cam_id_var        = tk.StringVar(value="A89C6C004BF5")
+system_active_var = tk.BooleanVar(value=True)
+
+for _v in (snap_before_var, snap_after_var, buffer_secs_var,
+           crop_padding_var, min_box_pct_var, vision_model_var, text_model_var,
+           cam_name_var, cam_id_var):
+    _v.trace_add("write", schedule_save)
+
+# --- Status bar and debug (outside tabs, always visible) ---
 status_var = tk.StringVar(value="Starting...")
 tk.Label(root, textvariable=status_var, bg="#0a0a0a", fg="#444444",
          font=("Courier New", 9), anchor="w", padx=12, pady=4).pack(fill=tk.X, side=tk.BOTTOM)
-
-# Debug indicator
 if DEBUG_MODE:
     tk.Label(root, text="● DEBUG MODE ON", bg="#0a0a0a", fg="#ff6600",
              font=("Courier New", 9, "bold"), anchor="e", padx=12).pack(fill=tk.X, side=tk.BOTTOM)
 
-# Top: model
-top_bar = tk.Frame(root, bg="#0a0a0a")
-top_bar.pack(fill=tk.X, padx=14, pady=(14, 4))
-
-tk.Label(top_bar, text="MODEL", bg="#0a0a0a", fg="#444444",
-         font=("Courier New", 9, "bold")).pack(side=tk.LEFT, padx=(0, 8))
-
-model_var = tk.StringVar(value=DEFAULT_MODEL)
+# --- Notebook (tabs) ---
 style = ttk.Style()
 style.theme_use("clam")
+style.configure("Dark.TNotebook",
+    background="#0a0a0a", borderwidth=0, tabmargins=[0, 0, 0, 0])
+style.configure("Dark.TNotebook.Tab",
+    background="#111111", foreground="#555555",
+    padding=[16, 6], font=("Courier New", 10, "bold"),
+    borderwidth=0)
+style.map("Dark.TNotebook.Tab",
+    background=[("selected", "#0a0a0a")],
+    foreground=[("selected", "#00ff88")])
 style.configure("Dark.TCombobox",
-    fieldbackground="#111111", background="#111111",
-    foreground="#00ff88", arrowcolor="#00ff88",
-    selectbackground="#003322", selectforeground="#00ff88",
-    bordercolor="#222222", lightcolor="#111111", darkcolor="#111111"
-)
-model_dropdown = ttk.Combobox(top_bar, textvariable=model_var,
-                               font=("Courier New", 10), style="Dark.TCombobox",
-                               state="readonly", width=28)
-model_dropdown.pack(side=tk.LEFT)
+    fieldbackground="#f5f5f5", background="#f5f5f5",
+    foreground="#000000", arrowcolor="#333333",
+    selectbackground="#0078d7", selectforeground="#ffffff",
+    bordercolor="#cccccc", lightcolor="#f5f5f5", darkcolor="#f5f5f5")
 
-tk.Label(top_bar, text=f"💾 {SAVE_DIR}", bg="#0a0a0a", fg="#333333",
-         font=("Courier New", 8), padx=12).pack(side=tk.LEFT)
+notebook = ttk.Notebook(root, style="Dark.TNotebook")
+notebook.pack(fill=tk.BOTH, expand=True)
 
-# Two-panel: live stream | last detected
-panels = tk.Frame(root, bg="#0a0a0a")
-panels.pack(fill=tk.X, padx=14, pady=(8, 4))
+tab_camera = tk.Frame(notebook, bg="#0a0a0a")
+tab_master  = tk.Frame(notebook, bg="#0a0a0a")
+notebook.add(tab_camera, text="Front Door")
+notebook.add(tab_master,  text="Master")
 
-# Stream panel
+# ── update tab label when cam_name_var changes ──
+def _on_cam_name(*_):
+    notebook.tab(tab_camera, text=cam_name_var.get() or "Camera")
+    schedule_save()
+cam_name_var.trace_add("write", _on_cam_name)
+
+# ═══════════════════════════════════════════════
+# TAB 1 — CAMERA (Front Door)
+# ═══════════════════════════════════════════════
+
+# Live stream + detected panels
+panels = tk.Frame(tab_camera, bg="#0a0a0a")
+panels.pack(fill=tk.X, padx=14, pady=(12, 4))
+
 stream_panel = tk.Frame(panels, bg="#0a0a0a")
 stream_panel.pack(side=tk.LEFT, padx=(0, 8))
 
@@ -586,85 +958,384 @@ tk.Label(stream_header, textvariable=stream_status_var, bg="#0a0a0a", fg="#2a6a3
 
 stream_label = tk.Label(stream_panel, bg="#0d1a0d", text="Connecting to stream...",
                          fg="#2a5a2a", font=("Courier New", 9),
-                         width=40, height=10, anchor="center", relief=tk.FLAT)
+                         anchor="center", relief=tk.FLAT)
 stream_label.pack()
 
-# Detected panel
 detected_panel = tk.Frame(panels, bg="#0a0a0a")
 detected_panel.pack(side=tk.LEFT)
-
 tk.Label(detected_panel, text="LAST DETECTED (AI CROP)", bg="#0a0a0a", fg="#333333",
          font=("Courier New", 8, "bold")).pack(anchor="w")
-
 detected_label = tk.Label(detected_panel, bg="#111111", text="Waiting for event...",
                             fg="#333333", font=("Courier New", 9),
-                            width=40, height=10, anchor="center", relief=tk.FLAT)
+                            anchor="center", relief=tk.FLAT)
 detected_label.pack()
 
 # Output
-tk.Label(root, text="OUTPUT", bg="#0a0a0a", fg="#333333",
-         font=("Courier New", 8, "bold"), anchor="w", padx=14).pack(fill=tk.X, pady=(6,0))
-
-out_frame = tk.Frame(root, bg="#0a0a0a")
+tk.Label(tab_camera, text="OUTPUT", bg="#0a0a0a", fg="#333333",
+         font=("Courier New", 8, "bold"), anchor="w", padx=14).pack(fill=tk.X, pady=(6, 0))
+out_frame = tk.Frame(tab_camera, bg="#0a0a0a")
 out_frame.pack(fill=tk.BOTH, expand=True, padx=14)
-
 output_text = tk.Text(out_frame, bg="#111111", fg="#e0e0e0",
     font=("Courier New", 11), relief=tk.FLAT,
     padx=10, pady=8, wrap=tk.WORD, height=6,
-    state=tk.DISABLED, insertbackground="#00ff88",
-    selectbackground="#003322")
+    state=tk.DISABLED, insertbackground="#00ff88", selectbackground="#003322")
 out_scroll = tk.Scrollbar(out_frame, command=output_text.yview, bg="#111111")
 output_text.configure(yscrollcommand=out_scroll.set)
 out_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 output_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
 # Action row
-action_row = tk.Frame(root, bg="#0a0a0a")
+action_row = tk.Frame(tab_camera, bg="#0a0a0a")
 action_row.pack(fill=tk.X, padx=14, pady=(6, 4))
-
-browse_btn = tk.Button(
-    action_row, text="📁  BROWSE", command=browse_and_analyze,
-    bg="#111111", fg="#00ff88", font=("Courier New", 10, "bold"),
-    relief=tk.FLAT, padx=12, pady=10, cursor="hand2",
-    activebackground="#003322", activeforeground="#00ff88", bd=0
-)
-browse_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-snap_btn = tk.Button(
-    action_row, text="📡  TRIGGER TEST", command=snap_from_stream,
-    bg="#111111", fg="#00aaff", font=("Courier New", 10, "bold"),
-    relief=tk.FLAT, padx=12, pady=10, cursor="hand2",
-    activebackground="#001a33", activeforeground="#00aaff", bd=0
-)
-snap_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
-
+tk.Button(action_row, text="📁  BROWSE", command=browse_and_analyze,
+          bg="#111111", fg="#00ff88", font=("Courier New", 10, "bold"),
+          relief=tk.FLAT, padx=12, pady=10, cursor="hand2",
+          activebackground="#003322", activeforeground="#00ff88", bd=0
+          ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+tk.Button(action_row, text="📡  TRIGGER TEST", command=snap_from_stream,
+          bg="#111111", fg="#00aaff", font=("Courier New", 10, "bold"),
+          relief=tk.FLAT, padx=12, pady=10, cursor="hand2",
+          activebackground="#001a33", activeforeground="#00aaff", bd=0
+          ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+tk.Button(action_row, text="⬛  MASK ZONES", command=open_mask_wizard,
+          bg="#111111", fg="#ff8800", font=("Courier New", 10, "bold"),
+          relief=tk.FLAT, padx=12, pady=10, cursor="hand2",
+          activebackground="#2a1800", activeforeground="#ff8800", bd=0
+          ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
 timer_var = tk.StringVar(value="⏱  —")
 tk.Label(action_row, textvariable=timer_var, bg="#0a0a0a", fg="#00aaff",
          font=("Courier New", 12, "bold"), padx=14).pack(side=tk.RIGHT)
 
-# Prompt
-tk.Label(root, text="PROMPT", bg="#0a0a0a", fg="#333333",
-         font=("Courier New", 8, "bold"), anchor="w", padx=14).pack(fill=tk.X)
+# Timing / settings row
+def _timing_spin(parent, label, var, from_, to, increment, unit="s"):
+    f = tk.Frame(parent, bg="#0a0a0a")
+    f.pack(side=tk.LEFT, padx=(0, 14))
+    tk.Label(f, text=label, bg="#0a0a0a", fg="#555555",
+             font=("Courier New", 8)).pack(side=tk.LEFT)
+    tk.Spinbox(f, textvariable=var, from_=from_, to=to, increment=increment,
+               format="%.2f", width=6,
+               bg="#111111", fg="#00ff88", buttonbackground="#1a1a1a",
+               relief=tk.FLAT, font=("Courier New", 9),
+               insertbackground="#00ff88", highlightthickness=0
+               ).pack(side=tk.LEFT, padx=(4, 0))
+    tk.Label(f, text=unit, bg="#0a0a0a", fg="#444444",
+             font=("Courier New", 8)).pack(side=tk.LEFT, padx=(2, 0))
 
-prompt_frame = tk.Frame(root, bg="#0a0a0a")
-prompt_frame.pack(fill=tk.X, padx=14, pady=(2, 12))
+timing_frame = tk.Frame(tab_camera, bg="#0a0a0a")
+timing_frame.pack(fill=tk.X, padx=14, pady=(4, 10))
+tk.Label(timing_frame, text="SETTINGS", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(side=tk.LEFT, padx=(0, 14))
+_timing_spin(timing_frame, "buffer",   buffer_secs_var,  0.5, 30.0, 0.5)
+_timing_spin(timing_frame, "before",   snap_before_var,  0.1, 29.0, 0.1)
+_timing_spin(timing_frame, "after",    snap_after_var,   0.0, 29.0, 0.1)
+_timing_spin(timing_frame, "padding",  crop_padding_var, 0,   500,  10,  unit="px")
+_timing_spin(timing_frame, "min box",  min_box_pct_var,  0.0, 10.0, 0.01, unit="%")
+tk.Label(timing_frame, text="cam ID", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8)).pack(side=tk.LEFT, padx=(12, 2))
+tk.Entry(timing_frame, textvariable=cam_id_var, width=14,
+         bg="#111111", fg="#00ff88", insertbackground="#00ff88",
+         font=("Courier New", 9), relief=tk.FLAT, bd=2
+         ).pack(side=tk.LEFT, padx=(0, 4))
 
-prompt_text = tk.Text(prompt_frame, bg="#111111", fg="#999999",
-    font=("Courier New", 9), relief=tk.FLAT, padx=10, pady=6,
-    wrap=tk.WORD, height=4, insertbackground="#00ff88",
-    selectbackground="#003322")
-ps = tk.Scrollbar(prompt_frame, command=prompt_text.yview, bg="#111111")
-prompt_text.configure(yscrollcommand=ps.set)
-ps.pack(side=tk.RIGHT, fill=tk.Y)
-prompt_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-prompt_text.insert(tk.END, DEFAULT_PROMPT)
+# ═══════════════════════════════════════════════
+# TAB 2 — MASTER  (queue badge | left controls | right HA panel)
+# ═══════════════════════════════════════════════
+
+# Queue status badge — top of Master tab, click to open detail window
+_queue_badge_var = tk.StringVar(value="● idle")
+queue_badge = tk.Button(
+    tab_master, textvariable=_queue_badge_var,
+    command=open_queue_window,
+    bg="#0d0d0d", fg="#333333", activebackground="#1a1a1a", activeforeground="#00ff88",
+    font=("Courier New", 9, "bold"), relief=tk.FLAT, anchor="w",
+    padx=14, pady=6, cursor="hand2", bd=0)
+queue_badge.pack(fill=tk.X, side=tk.TOP)
+tk.Frame(tab_master, bg="#1a1a1a", height=1).pack(fill=tk.X, side=tk.TOP)
+
+master_cols = tk.Frame(tab_master, bg="#0a0a0a")
+master_cols.pack(fill=tk.X, expand=False)
+
+# ── LEFT COLUMN ──────────────────────────────
+master_left = tk.Frame(master_cols, bg="#0a0a0a")
+master_left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(20, 10), pady=16)
+
+# System on/off toggle
+def _update_toggle(*_):
+    active = system_active_var.get()
+    if active:
+        system_active.set()
+        toggle_btn.config(text="● SYSTEM  ON", fg="#00ff88",
+                          activeforeground="#00ff88", activebackground="#003322")
+    else:
+        system_active.clear()
+        toggle_btn.config(text="○ SYSTEM  OFF", fg="#ff4444",
+                          activeforeground="#ff4444", activebackground="#2a0000")
+    schedule_save()
+
+system_active_var.trace_add("write", _update_toggle)
+
+tk.Label(master_left, text="SYSTEM", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 4))
+toggle_btn = tk.Button(
+    master_left, text="● SYSTEM  ON",
+    command=lambda: system_active_var.set(not system_active_var.get()),
+    bg="#111111", fg="#00ff88", font=("Courier New", 14, "bold"),
+    relief=tk.FLAT, padx=20, pady=14, cursor="hand2",
+    activebackground="#003322", activeforeground="#00ff88", bd=0, width=20)
+toggle_btn.pack(anchor="w", pady=(0, 20))
+
+# Camera name
+tk.Label(master_left, text="CAMERA TAB NAME", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 4))
+tk.Entry(master_left, textvariable=cam_name_var,
+         bg="#111111", fg="#00ff88", font=("Courier New", 11),
+         relief=tk.FLAT, insertbackground="#00ff88",
+         selectbackground="#003322", width=30
+         ).pack(anchor="w", pady=(0, 20))
+
+# Models — two side-by-side
+model_row = tk.Frame(master_left, bg="#0a0a0a")
+model_row.pack(fill=tk.X, pady=(0, 4))
+
+vision_col = tk.Frame(model_row, bg="#0a0a0a")
+vision_col.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+tk.Label(vision_col, text="VISION MODEL", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 4))
+vision_model_dropdown = ttk.Combobox(vision_col, textvariable=vision_model_var,
+                                      font=("Courier New", 10), style="Dark.TCombobox",
+                                      state="readonly", width=28)
+vision_model_dropdown.pack(anchor="w", pady=(0, 2))
+vision_model_info_lbl = tk.Label(vision_col, text="—", bg="#0a0a0a", fg="#333333",
+                                  font=("Courier New", 7), anchor="w")
+vision_model_info_lbl.pack(anchor="w", pady=(0, 8))
+
+text_col = tk.Frame(model_row, bg="#0a0a0a")
+text_col.pack(side=tk.LEFT, fill=tk.X, expand=True)
+tk.Label(text_col, text="TEXT MODEL", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 4))
+text_model_dropdown = ttk.Combobox(text_col, textvariable=text_model_var,
+                                    font=("Courier New", 10), style="Dark.TCombobox",
+                                    state="readonly", width=28)
+text_model_dropdown.pack(anchor="w", pady=(0, 2))
+text_model_info_lbl = tk.Label(text_col, text="—", bg="#0a0a0a", fg="#333333",
+                                font=("Courier New", 7), anchor="w")
+text_model_info_lbl.pack(anchor="w", pady=(0, 8))
+
+# Refresh info labels whenever selection changes
+vision_model_var.trace_add("write", _update_model_info_labels)
+text_model_var.trace_add("write",   _update_model_info_labels)
+
+tk.Label(master_left, text=f"💾  {SAVE_DIR}", bg="#0a0a0a", fg="#333333",
+         font=("Courier New", 8)).pack(anchor="w", pady=(0, 12))
+
+# Vision Prompt
+tk.Label(master_left, text="VISION PROMPT", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 4))
+vision_prompt_frame = tk.Frame(master_left, bg="#0a0a0a")
+vision_prompt_frame.pack(fill=tk.BOTH, expand=True)
+vision_prompt_text = tk.Text(vision_prompt_frame, bg="#111111", fg="#999999",
+    font=("Courier New", 9), relief=tk.FLAT, padx=10, pady=8,
+    wrap=tk.WORD, insertbackground="#00ff88", selectbackground="#003322", height=7)
+vps = tk.Scrollbar(vision_prompt_frame, command=vision_prompt_text.yview, bg="#111111")
+vision_prompt_text.configure(yscrollcommand=vps.set)
+vps.pack(side=tk.RIGHT, fill=tk.Y)
+vision_prompt_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+vision_prompt_text.insert(tk.END, DEFAULT_VISION_PROMPT)
+vision_prompt_text.bind("<KeyRelease>", schedule_save)
+vision_prompt_text.bind("<<Paste>>",    schedule_save)
+
+# Text Prompt
+tk.Label(master_left, text="TEXT PROMPT", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(anchor="w", pady=(10, 4))
+text_prompt_frame = tk.Frame(master_left, bg="#0a0a0a")
+text_prompt_frame.pack(fill=tk.BOTH, expand=True)
+text_prompt_text = tk.Text(text_prompt_frame, bg="#111111", fg="#999999",
+    font=("Courier New", 9), relief=tk.FLAT, padx=10, pady=8,
+    wrap=tk.WORD, insertbackground="#00ff88", selectbackground="#003322", height=7)
+tps = tk.Scrollbar(text_prompt_frame, command=text_prompt_text.yview, bg="#111111")
+text_prompt_text.configure(yscrollcommand=tps.set)
+tps.pack(side=tk.RIGHT, fill=tk.Y)
+text_prompt_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+text_prompt_text.insert(tk.END, DEFAULT_TEXT_PROMPT)
+text_prompt_text.bind("<KeyRelease>", schedule_save)
+text_prompt_text.bind("<<Paste>>",    schedule_save)
+
+# ── RIGHT COLUMN — HOME ASSISTANT ────────────
+master_right = tk.Frame(master_cols, bg="#0d0d0d", width=320)
+master_right.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 0), pady=0)
+master_right.pack_propagate(False)
+
+# Header
+ha_header = tk.Frame(master_right, bg="#0d0d0d")
+ha_header.pack(fill=tk.X, padx=12, pady=(14, 6))
+tk.Label(ha_header, text="HOME ASSISTANT", bg="#0d0d0d", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(side=tk.LEFT)
+ha_status_var = tk.StringVar(value="○ Disconnected")
+tk.Label(ha_header, textvariable=ha_status_var, bg="#0d0d0d", fg="#336633",
+         font=("Courier New", 8)).pack(side=tk.LEFT, padx=(8, 0))
+
+# Chicago time clock — updates every second
+ha_clock_var = tk.StringVar(value="")
+tk.Label(ha_header, textvariable=ha_clock_var, bg="#0d0d0d", fg="#3a6a4a",
+         font=("Courier New", 8)).pack(side=tk.RIGHT)
+
+def _update_ha_clock():
+    ha_clock_var.set(datetime.now(CHICAGO_TZ).strftime("%I:%M:%S %p CDT"))
+    root.after(1000, _update_ha_clock)
+_update_ha_clock()
+
+# Scrollable entity list
+ha_canvas = tk.Canvas(master_right, bg="#0d0d0d", highlightthickness=0)
+ha_scroll = tk.Scrollbar(master_right, orient="vertical",
+                          command=ha_canvas.yview, bg="#111111")
+ha_canvas.configure(yscrollcommand=ha_scroll.set)
+ha_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+ha_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+ha_list = tk.Frame(ha_canvas, bg="#0d0d0d")
+ha_canvas_window = ha_canvas.create_window((0, 0), window=ha_list, anchor="nw")
+
+def _ha_canvas_resize(e):
+    ha_canvas.configure(scrollregion=ha_canvas.bbox("all"))
+    ha_canvas.itemconfig(ha_canvas_window, width=e.width)
+ha_canvas.bind("<Configure>", _ha_canvas_resize)
+
+# Helper to build a generic sensor row in the HA list
+def _ha_sensor_row(label_text, init_val="—"):
+    row = tk.Frame(ha_list, bg="#0d0d0d")
+    row.pack(fill=tk.X, padx=12, pady=1)
+    dot = tk.Label(row, text="○", bg="#0d0d0d", fg="#333333",
+                   font=("Courier New", 10, "bold"), width=2)
+    dot.pack(side=tk.LEFT)
+    tk.Label(row, text=label_text, bg="#0d0d0d", fg="#555555",
+             font=("Courier New", 8), width=16, anchor="w").pack(side=tk.LEFT)
+    val = tk.Label(row, text=init_val, bg="#0d0d0d", fg="#444444",
+                   font=("Courier New", 8), anchor="w")
+    val.pack(side=tk.LEFT)
+    return dot, val
+
+# Build entity rows grouped
+for group_name, entities in HA_GROUPS:
+    tk.Label(ha_list, text=group_name, bg="#0d0d0d", fg="#333333",
+             font=("Courier New", 7, "bold"), padx=12,
+             anchor="w").pack(fill=tk.X, pady=(8, 2))
+    for eid in entities:
+        row = tk.Frame(ha_list, bg="#0d0d0d")
+        row.pack(fill=tk.X, padx=12, pady=1)
+        dot_lbl = tk.Label(row, text="○", bg="#0d0d0d", fg="#333333",
+                           font=("Courier New", 10, "bold"), width=2)
+        dot_lbl.pack(side=tk.LEFT)
+        tk.Label(row, text=HA_NAMES.get(eid, eid), bg="#0d0d0d", fg="#555555",
+                 font=("Courier New", 8), width=16, anchor="w").pack(side=tk.LEFT)
+        val_lbl = tk.Label(row, text="—", bg="#0d0d0d", fg="#444444",
+                           font=("Courier New", 8), anchor="w")
+        val_lbl.pack(side=tk.LEFT)
+        ha_row_labels[eid] = {"dot": dot_lbl, "val": val_lbl}
+
+    # Inject synthetic sensors under OCCUPANCY
+    if group_name == "OCCUPANCY":
+        _sc_dot, _sc_val = _ha_sensor_row("child detected", "clear")
+        _sj_dot, _sj_val = _ha_sensor_row("jacob detected", "clear")
+        _sl_dot, _sl_val = _ha_sensor_row("lauren detected","clear")
+        # Emergency row
+        emerg_row = tk.Frame(ha_list, bg="#0d0d0d")
+        emerg_row.pack(fill=tk.X, padx=12, pady=1)
+        _se_dot = tk.Label(emerg_row, text="○", bg="#0d0d0d", fg="#333333",
+                           font=("Courier New", 10, "bold"), width=2)
+        _se_dot.pack(side=tk.LEFT)
+        tk.Label(emerg_row, text="⚠ child alone", bg="#0d0d0d", fg="#884400",
+                 font=("Courier New", 8, "bold"), width=16, anchor="w").pack(side=tk.LEFT)
+        _se_val = tk.Label(emerg_row, text="clear", bg="#0d0d0d", fg="#444444",
+                           font=("Courier New", 8), anchor="w")
+        _se_val.pack(side=tk.LEFT)
+        synth.set_ui_refs(
+            child_dot=_sc_dot,  child_val=_sc_val,
+            jacob_dot=_sj_dot,  jacob_val=_sj_val,
+            lauren_dot=_sl_dot, lauren_val=_sl_val,
+            emerg_dot=_se_dot,  emerg_val=_se_val,
+        )
+
+# CAMERA group — distance sensor (populated by detection events)
+tk.Label(ha_list, text="CAMERA", bg="#0d0d0d", fg="#333333",
+         font=("Courier New", 7, "bold"), padx=12,
+         anchor="w").pack(fill=tk.X, pady=(8, 2))
+dist_row = tk.Frame(ha_list, bg="#0d0d0d")
+dist_row.pack(fill=tk.X, padx=12, pady=1)
+_ddot = tk.Label(dist_row, text="○", bg="#0d0d0d", fg="#444444",
+                 font=("Courier New", 10, "bold"), width=2)
+_ddot.pack(side=tk.LEFT)
+tk.Label(dist_row, text="distance", bg="#0d0d0d", fg="#555555",
+         font=("Courier New", 8), width=16, anchor="w").pack(side=tk.LEFT)
+_dval = tk.Label(dist_row, text="—", bg="#0d0d0d", fg="#444444",
+                 font=("Courier New", 8), anchor="w")
+_dval.pack(side=tk.LEFT)
+# Wire up to the module-level refs used by _update_distance_display
+distance_dot_lbl = _ddot
+distance_val_lbl  = _dval
+
+ha_list.update_idletasks()
+ha_canvas.configure(scrollregion=ha_canvas.bbox("all"))
+
+# ═══════════════════════════════════════════════
+# MASTER TAB — DETECTION RESULTS (bottom panel)
+# ═══════════════════════════════════════════════
+tk.Frame(tab_master, bg="#222222", height=1).pack(fill=tk.X, padx=14, pady=(4, 0))
+
+det_outer = tk.Frame(tab_master, bg="#0a0a0a")
+det_outer.pack(fill=tk.BOTH, expand=True, padx=14, pady=(6, 10))
+
+tk.Label(det_outer, text="LAST DETECTION", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 6))
+
+det_inner = tk.Frame(det_outer, bg="#0a0a0a")
+det_inner.pack(fill=tk.BOTH, expand=True)
+
+# 1. Cropped image
+det_img_col = tk.Frame(det_inner, bg="#0a0a0a")
+det_img_col.pack(side=tk.LEFT, padx=(0, 10), anchor="n")
+tk.Label(det_img_col, text="CROP", bg="#0a0a0a", fg="#333333",
+         font=("Courier New", 7, "bold")).pack(anchor="w")
+master_detected_label = tk.Label(det_img_col, bg="#111111",
+                                  text="—", fg="#333333",
+                                  font=("Courier New", 8),
+                                  width=28, height=9, anchor="center")
+master_detected_label.pack()
+
+def _make_det_col(parent, title, font_size=8, fg="#888888"):
+    col = tk.Frame(parent, bg="#0a0a0a")
+    col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
+    tk.Label(col, text=title, bg="#0a0a0a", fg="#333333",
+             font=("Courier New", 7, "bold")).pack(anchor="w")
+    inner = tk.Frame(col, bg="#0a0a0a")
+    inner.pack(fill=tk.BOTH, expand=True)
+    txt = tk.Text(inner, bg="#111111", fg=fg,
+                  font=("Courier New", font_size), relief=tk.FLAT,
+                  padx=6, pady=6, wrap=tk.WORD,
+                  state=tk.DISABLED, selectbackground="#003322")
+    scr = tk.Scrollbar(inner, command=txt.yview, bg="#111111")
+    txt.configure(yscrollcommand=scr.set)
+    scr.pack(side=tk.RIGHT, fill=tk.Y)
+    txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    return txt
+
+# 2. Vision model result
+master_vision_text = _make_det_col(det_inner, "VISION RESULT",  font_size=8, fg="#666666")
+
+# 3. Text model input (full prompt sent to text model)
+master_input_text  = _make_det_col(det_inner, "TEXT MODEL INPUT", font_size=7, fg="#444444")
+
+# 4. Text model result
+master_result_text = _make_det_col(det_inner, "JUDGMENT",       font_size=9, fg="#e0e0e0")
 
 # ---------------------------------------------------------------
 # START SERVICES
 # ---------------------------------------------------------------
-threading.Thread(target=run_flask, daemon=True).start()
+load_config()   # apply saved settings before threads start
+
+threading.Thread(target=run_flask,    daemon=True).start()
 threading.Thread(target=queue_worker, daemon=True).start()
 threading.Thread(target=buffer_worker, daemon=True).start()
 threading.Thread(target=warmup_model, daemon=True).start()
+threading.Thread(target=ha_worker,    daemon=True).start()
 
 root.mainloop()
