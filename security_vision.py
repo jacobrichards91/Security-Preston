@@ -149,53 +149,83 @@ text_model_info_lbl   = None
 # ---------------------------------------------------------------
 # SYNTHETIC SENSORS  (derived from vision model output)
 # ---------------------------------------------------------------
-_synth          = {"child": False, "resident": False}
-_child_timer    = None   # threading.Timer — auto-off after 5 min
-_resident_timer = None
+_synth         = {"child": False, "jacob": False, "lauren": False}
+_child_timer   = None   # threading.Timer — auto-off after 5 min
+_jacob_timer   = None
+_lauren_timer  = None
 
 # UI label refs (assigned during HA panel build)
 synth_child_dot  = None;  synth_child_val  = None
-synth_res_dot    = None;  synth_res_val    = None
+synth_jacob_dot  = None;  synth_jacob_val  = None
+synth_lauren_dot = None;  synth_lauren_val = None
 synth_emerg_dot  = None;  synth_emerg_val  = None
 
-# Keywords/patterns the vision model might use
+# --- Keywords / patterns ---
 _CHILD_KEYWORDS = [
     "child", "children", "baby", "babies", "toddler", "toddlers",
     "infant", "infants", "kid ", "kids ", "young child", "small child",
     "little one", "little ones", "youngster", "youngsters", "minor",
 ]
 
-_RESIDENT_PATTERNS = [re.compile(p, re.IGNORECASE) for p in [
-    # Woman with brown / dark hair
-    r"woman.{0,50}brown\s*hair",       r"brown\s*hair.{0,50}woman",
-    r"female.{0,50}brown\s*hair",      r"brown\s*hair.{0,50}female",
-    r"lady.{0,50}brown\s*hair",        r"brown\s*hair.{0,50}lady",
-    r"woman.{0,50}dark\s*hair",        r"dark\s*hair.{0,50}woman",
-    r"female.{0,50}dark\s*hair",       r"dark\s*hair.{0,50}female",
+# Jacob: man with brown / black / dark hair (gated on jacob_is_home)
+_JACOB_PATTERNS = [re.compile(p, re.IGNORECASE) for p in [
+    r"man.{0,50}brown\s*hair",                 r"brown\s*hair.{0,50}man",
+    r"man.{0,50}black\s*hair",                 r"black\s*hair.{0,50}man",
+    r"man.{0,50}dark\s*hair",                  r"dark\s*hair.{0,50}man",
+    r"male.{0,50}brown\s*hair",                r"brown\s*hair.{0,50}male",
+    r"male.{0,50}black\s*hair",                r"black\s*hair.{0,50}male",
+    r"male.{0,50}dark\s*hair",                 r"dark\s*hair.{0,50}male",
+    r"guy.{0,50}(brown|black|dark)\s*hair",    r"(brown|black|dark)\s*hair.{0,50}guy",
+    r"brown[\-\s]haired\s+\w*\s*(man|male|guy|gentleman)",
+    r"black[\-\s]haired\s+\w*\s*(man|male|guy|gentleman)",
+    r"dark[\-\s]haired\s+\w*\s*(man|male|guy|gentleman)",
+    r"(man|male|guy)\s+\w*\s*brown[\-\s]hair",
+    r"(man|male|guy)\s+\w*\s*black[\-\s]hair",
+    r"(man|male|guy)\s+\w*\s*dark[\-\s]hair",
+    r"adult\s+male.{0,50}(brown|black|dark)\s*hair",
+    r"(brown|black|dark)\s*hair.{0,50}adult\s+male",
+    r"man\s+with\s+(short|long|medium|curly|straight|wavy)?\s*(brown|black|dark)\s*hair",
+    r"(brown|black|dark)[\-\s]haired\s+adult",
+    r"individual.{0,30}man.{0,30}(brown|black|dark)\s*hair",
+    r"person.{0,20}appears\s+to\s+be\s+(a\s+)?male.{0,50}(brown|black|dark)\s*hair",
+]]
+
+# Lauren: woman with brown/dark hair OR woman aged 20-35 (gated on lauren_is_home)
+_LAUREN_PATTERNS = [re.compile(p, re.IGNORECASE) for p in [
+    # Brown / dark hair
+    r"woman.{0,50}brown\s*hair",               r"brown\s*hair.{0,50}woman",
+    r"female.{0,50}brown\s*hair",              r"brown\s*hair.{0,50}female",
+    r"lady.{0,50}brown\s*hair",                r"brown\s*hair.{0,50}lady",
+    r"girl.{0,50}brown\s*hair",                r"brown\s*hair.{0,50}girl",
+    r"woman.{0,50}dark\s*hair",                r"dark\s*hair.{0,50}woman",
+    r"female.{0,50}dark\s*hair",               r"dark\s*hair.{0,50}female",
     r"brunette",
     r"brown[\-\s]haired\s+\w*\s*(woman|female|lady|girl)",
+    r"dark[\-\s]haired\s+\w*\s*(woman|female|lady|girl)",
     r"(woman|female|lady|girl)\s+\w*\s*brown[\-\s]hair",
     r"adult\s+female.{0,50}(brown|dark)\s*hair",
     r"(brown|dark)\s*hair.{0,50}adult\s+female",
-    # Man with brown / black / dark hair
-    r"man.{0,50}brown\s*hair",         r"brown\s*hair.{0,50}man",
-    r"man.{0,50}black\s*hair",         r"black\s*hair.{0,50}man",
-    r"man.{0,50}dark\s*hair",          r"dark\s*hair.{0,50}man",
-    r"male.{0,50}brown\s*hair",        r"brown\s*hair.{0,50}male",
-    r"male.{0,50}black\s*hair",        r"black\s*hair.{0,50}male",
-    r"male.{0,50}dark\s*hair",         r"dark\s*hair.{0,50}male",
-    r"guy.{0,50}(brown|black|dark)\s*hair",
-    r"(brown|black|dark)\s*hair.{0,50}guy",
-    r"brown[\-\s]haired\s+\w*\s*(man|male|guy|person)",
-    r"black[\-\s]haired\s+\w*\s*(man|male|guy|person)",
-    r"dark[\-\s]haired\s+\w*\s*(man|male|guy|person)",
-    r"adult\s+male.{0,50}(brown|black|dark)\s*hair",
-    r"(brown|black|dark)\s*hair.{0,50}adult\s+male",
-    r"adult.{0,50}(brown|black|dark)\s*hair",
-    r"person.{0,50}(brown|black|dark)\s*hair",
-    r"individual.{0,50}(brown|black|dark)\s*hair",
-    r"man\s+with\s+(short|long|medium|curly|straight)?\s*(brown|black|dark)\s*hair",
-    r"woman\s+with\s+(short|long|medium|curly|straight)?\s*(brown|dark)\s*hair",
+    r"woman\s+with\s+(short|long|medium|curly|straight|wavy)?\s*(brown|dark)\s*hair",
+    # Age 20-35
+    r"woman.{0,40}(in her |aged? )?(20s|twenties|30s|thirties)",
+    r"(20s|twenties|30s|thirties).{0,40}woman",
+    r"female.{0,40}(in her |aged? )?(20s|twenties|30s|thirties)",
+    r"(20s|twenties|30s|thirties).{0,40}female",
+    r"(woman|female|lady).{0,30}mid[\-\s]?(twenties|20s)",
+    r"(woman|female|lady).{0,30}late[\-\s]?(twenties|20s)",
+    r"(woman|female|lady).{0,30}early[\-\s]?(thirties|30s)",
+    r"(woman|female|lady).{0,30}mid[\-\s]?(thirties|30s)",
+    r"20[\-\s]?something.{0,30}(woman|female|lady)",
+    r"30[\-\s]?something.{0,30}(woman|female|lady)",
+    r"(woman|female|lady).{0,30}20[\-\s]?something",
+    r"(woman|female|lady).{0,30}30[\-\s]?something",
+    r"young\s+adult\s+(woman|female|lady)",
+    r"(woman|female|lady).{0,20}young\s+adult",
+    # Numeric age 20-35
+    r"(woman|female|lady).{0,40}(approximately|about|around|age\s+)?(2[0-9]|3[0-5])\s*(year|yr|y\.?o)",
+    r"(approximately|about|around|age\s+)?(2[0-9]|3[0-5])\s*(year|yr|y\.?o).{0,40}(woman|female|lady)",
+    r"(woman|female).{0,40}between\s+\d+\s+and\s+3[0-5]",
+    r"(woman|female).{0,40}appears\s+to\s+be\s+(in\s+her\s+)?(20|25|30|35)",
 ]]
 
 
@@ -214,16 +244,19 @@ def _apply_synth_row(dot, val, active, text, alert=False):
 
 
 def _refresh_synth_ui():
-    """Recompute derived states and update all 3 synthetic sensor rows. Main thread only."""
-    child    = _synth["child"]
-    resident = _synth["resident"]
-    emerg    = child and not resident
-    _apply_synth_row(synth_child_dot, synth_child_val,
-                     child,    "detected" if child else "clear")
-    _apply_synth_row(synth_res_dot,   synth_res_val,
-                     resident, "detected" if resident else "clear")
-    _apply_synth_row(synth_emerg_dot, synth_emerg_val,
-                     emerg,    "ACTIVE" if emerg else "clear", alert=emerg)
+    """Recompute derived states and update all 4 synthetic sensor rows. Main thread only."""
+    child  = _synth["child"]
+    jacob  = _synth["jacob"]
+    lauren = _synth["lauren"]
+    emerg  = child and not (jacob or lauren)
+    _apply_synth_row(synth_child_dot,  synth_child_val,
+                     child,  "detected" if child  else "clear")
+    _apply_synth_row(synth_jacob_dot,  synth_jacob_val,
+                     jacob,  "detected" if jacob  else "clear")
+    _apply_synth_row(synth_lauren_dot, synth_lauren_val,
+                     lauren, "detected" if lauren else "clear")
+    _apply_synth_row(synth_emerg_dot,  synth_emerg_val,
+                     emerg,  "ACTIVE"   if emerg  else "clear", alert=emerg)
 
 
 def _set_synth(key, value):
@@ -232,31 +265,42 @@ def _set_synth(key, value):
     _refresh_synth_ui()
 
 
+def _arm_timer(key, timer_ref_name):
+    """Cancel existing timer for key and start a fresh 5-minute auto-off."""
+    import sys
+    old = globals().get(timer_ref_name)
+    if old:
+        old.cancel()
+    t = threading.Timer(300, lambda: root.after(0, lambda: _set_synth(key, False)))
+    t.daemon = True
+    t.start()
+    globals()[timer_ref_name] = t
+
+
 def check_synthetic_sensors(vision_result):
     """
-    Parse vision model output and update child / resident synthetic sensors.
-    Safe to call from any thread — UI updates are marshalled via root.after.
+    Parse vision model output and update synthetic sensors.
+    Jacob/Lauren are gated on their respective HA home-presence sensor.
+    Safe to call from any thread — UI updates marshalled via root.after.
     """
-    global _child_timer, _resident_timer
     text = vision_result.lower()
 
-    # Child detection
+    # --- Child (no HA gate) ---
     if any(kw in text for kw in _CHILD_KEYWORDS):
-        if _child_timer:
-            _child_timer.cancel()
-        _child_timer = threading.Timer(300, lambda: root.after(0, lambda: _set_synth("child", False)))
-        _child_timer.daemon = True
-        _child_timer.start()
+        _arm_timer("child", "_child_timer")
         root.after(0, lambda: _set_synth("child", True))
 
-    # Resident (Jacob / Lauren) detection
-    if any(p.search(text) for p in _RESIDENT_PATTERNS):
-        if _resident_timer:
-            _resident_timer.cancel()
-        _resident_timer = threading.Timer(300, lambda: root.after(0, lambda: _set_synth("resident", False)))
-        _resident_timer.daemon = True
-        _resident_timer.start()
-        root.after(0, lambda: _set_synth("resident", True))
+    # --- Jacob: man with brown/black/dark hair, only if jacob_is_home=on ---
+    if ha_state.get("input_boolean.jacob_is_home", "off") == "on":
+        if any(p.search(text) for p in _JACOB_PATTERNS):
+            _arm_timer("jacob", "_jacob_timer")
+            root.after(0, lambda: _set_synth("jacob", True))
+
+    # --- Lauren: woman (brown hair OR aged 20-35), only if lauren_is_home=on ---
+    if ha_state.get("input_boolean.lauren_is_home", "off") == "on":
+        if any(p.search(text) for p in _LAUREN_PATTERNS):
+            _arm_timer("lauren", "_lauren_timer")
+            root.after(0, lambda: _set_synth("lauren", True))
 
 # ---------------------------------------------------------------
 # HOME ASSISTANT CONFIG
@@ -767,13 +811,15 @@ def build_ha_context():
     """Format current HA state into a readable string for the text model."""
     lines = []
     # Synthetic sensors first
-    child    = _synth["child"]
-    resident = _synth["resident"]
-    emerg    = child and not resident
+    child  = _synth["child"]
+    jacob  = _synth["jacob"]
+    lauren = _synth["lauren"]
+    emerg  = child and not (jacob or lauren)
     lines.append(
         f"SYNTHETIC SENSORS: "
         f"child_detected={'on' if child else 'off'}, "
-        f"jacob_lauren_detected={'on' if resident else 'off'}, "
+        f"jacob_detected={'on' if jacob else 'off'}, "
+        f"lauren_detected={'on' if lauren else 'off'}, "
         f"emergency_child_alone={'on' if emerg else 'off'}"
     )
     for group_name, entities in HA_GROUPS:
@@ -1881,9 +1927,10 @@ for group_name, entities in HA_GROUPS:
 
     # Inject synthetic sensors under OCCUPANCY
     if group_name == "OCCUPANCY":
-        synth_child_dot, synth_child_val = _ha_sensor_row("child detected",  "clear")
-        synth_res_dot,   synth_res_val   = _ha_sensor_row("jacob/lauren",    "clear")
-        # Emergency row — slightly indented label to show it's derived
+        synth_child_dot,  synth_child_val  = _ha_sensor_row("child detected", "clear")
+        synth_jacob_dot,  synth_jacob_val  = _ha_sensor_row("jacob detected", "clear")
+        synth_lauren_dot, synth_lauren_val = _ha_sensor_row("lauren detected","clear")
+        # Emergency row
         emerg_row = tk.Frame(ha_list, bg="#0d0d0d")
         emerg_row.pack(fill=tk.X, padx=12, pady=1)
         synth_emerg_dot = tk.Label(emerg_row, text="○", bg="#0d0d0d", fg="#333333",
