@@ -15,12 +15,15 @@ import cv2
 from PIL import Image, ImageTk, ImageDraw
 from pathlib import Path
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from flask import Flask, request
 import logging
 
 # --- Config ---
 OLLAMA_URL = "http://localhost:11434/api/generate"
-DEFAULT_MODEL = "minicpm-v:latest"
+DEFAULT_VISION_MODEL = "minicpm-v:latest"
+DEFAULT_TEXT_MODEL   = "minicpm-v:latest"
+CHICAGO_TZ = ZoneInfo("America/Chicago")
 WEBHOOK_PORT = 8765
 SAVE_DIR = Path(os.path.expanduser("~")) / "SecurityEvents"
 SAVE_DIR.mkdir(exist_ok=True)
@@ -43,11 +46,25 @@ CROP_PADDING = 50             # px padding around bounding box (default, overrid
 
 DEBUG_MODE = True             # show debug windows
 
-DEFAULT_PROMPT = """You are a security camera analyzer. Look for people, vehicles, and animals ONLY.
+DEFAULT_VISION_PROMPT = """You are a security camera analyzer. Look for people, vehicles, and animals ONLY.
 
 For each one found, describe: count, type, appearance, and behavior.
 
 If none are present, respond with only: CLEAR"""
+
+DEFAULT_TEXT_PROMPT = """You are a home security analyst with full situational awareness of the house.
+
+You will receive:
+1. The current date and time (Chicago)
+2. The live state of all sensors, doors, locks, and occupancy in the home
+3. A visual description from a security camera that just detected motion
+
+Based on ALL of this context, provide a concise security assessment:
+- What was detected and is it expected given the time and home state?
+- Is this benign (resident, pet, expected visitor) or suspicious?
+- Any recommended action?
+
+Be brief and direct. If clearly benign, say so."""
 
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
@@ -431,13 +448,18 @@ def fetch_models():
         resp.raise_for_status()
         models = [m["name"] for m in resp.json().get("models", [])]
         if models:
-            model_dropdown["values"] = models
+            vision_model_dropdown["values"] = models
+            text_model_dropdown["values"]   = models
+            # Default vision model to minicpm-v
             if "minicpm-v:latest" in models:
-                model_var.set("minicpm-v:latest")
+                vision_model_var.set("minicpm-v:latest")
             elif any("minicpm-v" in m for m in models):
-                model_var.set(next(m for m in models if "minicpm-v" in m))
+                vision_model_var.set(next(m for m in models if "minicpm-v" in m))
             else:
-                model_var.set(models[0])
+                vision_model_var.set(models[0])
+            # Default text model — keep whatever is loaded, fall back to first
+            if text_model_var.get() not in models:
+                text_model_var.set(models[0])
     except Exception as e:
         status_var.set(f"⚠️ Could not fetch models: {e}")
 
@@ -445,17 +467,16 @@ def warmup_model():
     status_var.set("⏳ Loading models...")
     fetch_models()
     try:
-        requests.post(OLLAMA_URL, json={
-            "model": model_var.get(),
-            "prompt": "ready",
-            "stream": False,
-            "keep_alive": -1
-        }, timeout=60)
+        for m in {vision_model_var.get(), text_model_var.get()}:
+            requests.post(OLLAMA_URL, json={
+                "model": m, "prompt": "ready", "stream": False, "keep_alive": -1
+            }, timeout=60)
         update_queue_status()
     except Exception as e:
         status_var.set(f"⚠️ Warmup failed: {e}")
 
 def analyze_image_bytes(image_bytes, prompt, model):
+    """Run a vision model with an image attached."""
     image_b64 = base64.b64encode(image_bytes).decode()
     payload = {
         "model": model,
@@ -467,6 +488,26 @@ def analyze_image_bytes(image_bytes, prompt, model):
     response = requests.post(OLLAMA_URL, json=payload, timeout=120)
     response.raise_for_status()
     return response.json().get("response", "No response received.")
+
+def analyze_text(prompt, model):
+    """Run a text-only model (no image)."""
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "keep_alive": -1
+    }
+    response = requests.post(OLLAMA_URL, json=payload, timeout=120)
+    response.raise_for_status()
+    return response.json().get("response", "No response received.")
+
+def build_ha_context():
+    """Format current HA state into a readable string for the text model."""
+    lines = []
+    for group_name, entities in HA_GROUPS:
+        parts = [f"{HA_NAMES.get(e, e)}={ha_state.get(e, 'unknown')}" for e in entities]
+        lines.append(f"{group_name}: {', '.join(parts)}")
+    return "\n".join(lines)
 
 def update_queue_status():
     qsize = analysis_queue.qsize()
@@ -483,76 +524,93 @@ def queue_worker():
     while True:
         item = analysis_queue.get()
         try:
-            trigger_ts = item["trigger_ts"]   # float epoch time of webhook
-            ts_str = item["ts_str"]
-            model = item["model"]
-            prompt = item["prompt"]
-            source = item.get("source", "webhook")
+            trigger_ts    = item["trigger_ts"]
+            ts_str        = item["ts_str"]
+            vision_model  = item["vision_model"]
+            text_model    = item["text_model"]
+            vision_prompt = item["vision_prompt"]
+            text_prompt   = item["text_prompt"]
+            source        = item.get("source", "webhook")
 
             root.after(0, lambda t=ts_str: status_var.set(f"📡 Processing event [{t}]"))
 
             if source == "manual":
-                # Manual browse — skip motion detection, send image directly
                 image_bytes = base64.b64decode(item["image_b64"])
+                root.after(0, lambda t=ts_str: status_var.set(f"👁 Vision [{t}]"))
                 t0 = time.time()
-                result = analyze_image_bytes(image_bytes, prompt, model)
+                vision_result = analyze_image_bytes(image_bytes, vision_prompt, vision_model)
+
+                root.after(0, lambda t=ts_str: status_var.set(f"🧠 Judgment [{t}]"))
+                chicago_now = datetime.now(CHICAGO_TZ).strftime("%A %B %d %Y  %I:%M:%S %p %Z")
+                full_text_prompt = (
+                    f"{text_prompt}\n\n"
+                    f"Time: {chicago_now}\n\n"
+                    f"Home state:\n{build_ha_context()}\n\n"
+                    f"Visual observation:\n{vision_result}"
+                )
+                text_result = analyze_text(full_text_prompt, text_model)
                 elapsed = time.time() - t0
+
                 _b = item["image_b64"]
-                root.after(0, lambda b=_b, r=result, t=ts_str, e=elapsed:
-                           finish_analysis(b, r, t, e))
-                save_event_background(None, None, image_bytes, result, None, ts_str)
+                root.after(0, lambda b=_b, vr=vision_result, tr=text_result, t=ts_str, e=elapsed:
+                           finish_analysis(b, vr, tr, t, e))
+                save_event_background(None, None, image_bytes, text_result, None, ts_str)
                 continue
 
-            # Both frames are in the past — no sleeping needed
-            ts_a = trigger_ts - snap_before_var.get()  # further back (frame A)
-            ts_b = trigger_ts - snap_after_var.get()   # closer to trigger (frame B)
+            # --- Grab frames (both in the past) ---
+            ts_a = trigger_ts - snap_before_var.get()
+            ts_b = trigger_ts - snap_after_var.get()
             frame_a = get_frame_at(ts_a)
             frame_b = get_frame_at(ts_b)
 
             if frame_a is None or frame_b is None:
                 root.after(0, lambda t=ts_str: status_var.set(
-                    f"⚠️ [{t}] Buffer miss — not enough frames yet"))
+                    f"⚠️ [{t}] Buffer miss — not enough frames"))
                 continue
 
-            # Apply exclusion mask before diff and AI
             if mask_rects:
                 frame_a = jpeg_apply_mask(frame_a)
                 frame_b = jpeg_apply_mask(frame_b)
 
-            root.after(0, lambda t=ts_str: status_var.set(f"🔬 Computing motion diff [{t}]"))
-
-            # --- Motion diff + crop ---
+            root.after(0, lambda t=ts_str: status_var.set(f"🔬 Motion diff [{t}]"))
             cropped_bytes, debug_imgs, bbox = compute_motion_crop(frame_a, frame_b)
 
-            # Show debug window
             if debug_imgs:
                 root.after(0, lambda d=debug_imgs: show_debug_window(d))
-
             if cropped_bytes is None:
-                # No motion detected — use full frame B
                 root.after(0, lambda t=ts_str: status_var.set(
-                    f"⚠️ [{t}] No motion detected — using full frame"))
+                    f"⚠️ [{t}] No motion — using full frame"))
                 cropped_bytes = frame_b
 
-            # Show crop in detected panel
             crop_b64 = base64.b64encode(cropped_bytes).decode()
             root.after(0, lambda b=crop_b64: show_detected_image(b))
 
-            # --- Analyze ---
+            # --- Stage 1: Vision model ---
             qsize = analysis_queue.qsize()
             root.after(0, lambda q=qsize, t=ts_str: status_var.set(
-                f"🔍 Analyzing [{t}]" + (f" — {q} more queued" if q > 0 else "")
-            ))
-
+                f"👁 Vision [{t}]" + (f" — {q} queued" if q else "")))
             t0 = time.time()
-            result = analyze_image_bytes(cropped_bytes, prompt, model)
+            vision_result = analyze_image_bytes(cropped_bytes, vision_prompt, vision_model)
+
+            # --- Stage 2: Text model with full context ---
+            root.after(0, lambda t=ts_str: status_var.set(f"🧠 Judgment [{t}]"))
+            chicago_now = datetime.now(CHICAGO_TZ).strftime("%A %B %d %Y  %I:%M:%S %p %Z")
+            full_text_prompt = (
+                f"{text_prompt}\n\n"
+                f"Time: {chicago_now}\n\n"
+                f"Home state:\n{build_ha_context()}\n\n"
+                f"Visual observation:\n{vision_result}"
+            )
+            text_result = analyze_text(full_text_prompt, text_model)
             elapsed = time.time() - t0
 
             _b64 = crop_b64
-            root.after(0, lambda b=_b64, r=result, t=ts_str, e=elapsed:
-                       finish_analysis(b, r, t, e))
+            root.after(0, lambda b=_b64, vr=vision_result, tr=text_result, t=ts_str, e=elapsed:
+                       finish_analysis(b, vr, tr, t, e))
 
-            save_event_background(frame_a, frame_b, cropped_bytes, result, bbox, ts_str)
+            save_event_background(frame_a, frame_b, cropped_bytes,
+                                  f"VISION:\n{vision_result}\n\nJUDGMENT:\n{text_result}",
+                                  bbox, ts_str)
 
         except Exception as e:
             import traceback
@@ -562,24 +620,30 @@ def queue_worker():
             analysis_queue.task_done()
             root.after(0, update_queue_status)
 
-def finish_analysis(image_b64, result, ts, elapsed):
+def finish_analysis(image_b64, vision_result, text_result, ts, elapsed):
     timer_var.set(f"⏱  {elapsed:.2f}s")
     show_detected_image(image_b64)
     output_text.config(state=tk.NORMAL)
     output_text.delete("1.0", tk.END)
-    output_text.insert(tk.END, result)
+    output_text.tag_configure("dim",   foreground="#555555", font=("Courier New", 9))
+    output_text.tag_configure("label", foreground="#444444", font=("Courier New", 8, "bold"))
+    output_text.tag_configure("main",  foreground="#e0e0e0", font=("Courier New", 11))
+    output_text.insert(tk.END, "👁  VISION\n", "label")
+    output_text.insert(tk.END, vision_result + "\n\n", "dim")
+    output_text.insert(tk.END, "🧠  JUDGMENT\n", "label")
+    output_text.insert(tk.END, text_result, "main")
     output_text.config(state=tk.DISABLED)
     update_queue_status()
 
 def enqueue_event(ts_float, ts_str, source="webhook", image_b64=None):
-    model = model_var.get()
-    prompt = prompt_text.get("1.0", tk.END).strip()
     item = {
-        "trigger_ts": ts_float,
-        "ts_str": ts_str,
-        "model": model,
-        "prompt": prompt,
-        "source": source,
+        "trigger_ts":    ts_float,
+        "ts_str":        ts_str,
+        "vision_model":  vision_model_var.get(),
+        "text_model":    text_model_var.get(),
+        "vision_prompt": vision_prompt_text.get("1.0", tk.END).strip(),
+        "text_prompt":   text_prompt_text.get("1.0", tk.END).strip(),
+        "source":        source,
     }
     if image_b64:
         item["image_b64"] = image_b64
@@ -909,8 +973,10 @@ def save_config(*_):
     """Write all tunable settings to config.json."""
     try:
         data = {
-            "model":           model_var.get(),
-            "prompt":          prompt_text.get("1.0", tk.END).rstrip("\n"),
+            "vision_model":    vision_model_var.get(),
+            "text_model":      text_model_var.get(),
+            "vision_prompt":   vision_prompt_text.get("1.0", tk.END).rstrip("\n"),
+            "text_prompt":     text_prompt_text.get("1.0", tk.END).rstrip("\n"),
             "snap_before":     snap_before_var.get(),
             "snap_after":      snap_after_var.get(),
             "buffer_secs":     buffer_secs_var.get(),
@@ -937,11 +1003,16 @@ def load_config():
         return
     try:
         data = json.loads(CONFIG_PATH.read_text())
-        if "model" in data:
-            model_var.set(data["model"])
-        if "prompt" in data:
-            prompt_text.delete("1.0", tk.END)
-            prompt_text.insert("1.0", data["prompt"])
+        if "vision_model" in data:
+            vision_model_var.set(data["vision_model"])
+        if "text_model" in data:
+            text_model_var.set(data["text_model"])
+        if "vision_prompt" in data:
+            vision_prompt_text.delete("1.0", tk.END)
+            vision_prompt_text.insert("1.0", data["vision_prompt"])
+        if "text_prompt" in data:
+            text_prompt_text.delete("1.0", tk.END)
+            text_prompt_text.insert("1.0", data["text_prompt"])
         if "snap_before" in data:
             snap_before_var.set(data["snap_before"])
         if "snap_after" in data:
@@ -978,12 +1049,13 @@ snap_after_var    = tk.DoubleVar(value=SNAP_AFTER_SECS)
 buffer_secs_var   = tk.DoubleVar(value=BUFFER_SECONDS)
 crop_padding_var  = tk.IntVar(value=CROP_PADDING)
 min_box_pct_var   = tk.DoubleVar(value=MIN_BOX_PCT)
-model_var         = tk.StringVar(value=DEFAULT_MODEL)
+vision_model_var  = tk.StringVar(value=DEFAULT_VISION_MODEL)
+text_model_var    = tk.StringVar(value=DEFAULT_TEXT_MODEL)
 cam_name_var      = tk.StringVar(value="Front Door")
 system_active_var = tk.BooleanVar(value=True)
 
 for _v in (snap_before_var, snap_after_var, buffer_secs_var,
-           crop_padding_var, min_box_pct_var, model_var):
+           crop_padding_var, min_box_pct_var, vision_model_var, text_model_var):
     _v.trace_add("write", schedule_save)
 
 # --- Status bar and debug (outside tabs, always visible) ---
@@ -1165,31 +1237,62 @@ tk.Entry(master_left, textvariable=cam_name_var,
          selectbackground="#003322", width=30
          ).pack(anchor="w", pady=(0, 20))
 
-# Model
-tk.Label(master_left, text="MODEL", bg="#0a0a0a", fg="#444444",
-         font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 4))
-model_dropdown = ttk.Combobox(master_left, textvariable=model_var,
-                               font=("Courier New", 10), style="Dark.TCombobox",
-                               state="readonly", width=32)
-model_dropdown.pack(anchor="w", pady=(0, 20))
-tk.Label(master_left, text=f"💾  {SAVE_DIR}", bg="#0a0a0a", fg="#333333",
-         font=("Courier New", 8)).pack(anchor="w", pady=(0, 20))
+# Models — two side-by-side
+model_row = tk.Frame(master_left, bg="#0a0a0a")
+model_row.pack(fill=tk.X, pady=(0, 4))
 
-# Prompt
-tk.Label(master_left, text="PROMPT", bg="#0a0a0a", fg="#444444",
+vision_col = tk.Frame(model_row, bg="#0a0a0a")
+vision_col.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+tk.Label(vision_col, text="VISION MODEL", bg="#0a0a0a", fg="#444444",
          font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 4))
-prompt_frame = tk.Frame(master_left, bg="#0a0a0a")
-prompt_frame.pack(fill=tk.BOTH, expand=True)
-prompt_text = tk.Text(prompt_frame, bg="#111111", fg="#999999",
+vision_model_dropdown = ttk.Combobox(vision_col, textvariable=vision_model_var,
+                                      font=("Courier New", 10), style="Dark.TCombobox",
+                                      state="readonly", width=20)
+vision_model_dropdown.pack(anchor="w", pady=(0, 4))
+
+text_col = tk.Frame(model_row, bg="#0a0a0a")
+text_col.pack(side=tk.LEFT, fill=tk.X, expand=True)
+tk.Label(text_col, text="TEXT MODEL", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 4))
+text_model_dropdown = ttk.Combobox(text_col, textvariable=text_model_var,
+                                    font=("Courier New", 10), style="Dark.TCombobox",
+                                    state="readonly", width=20)
+text_model_dropdown.pack(anchor="w", pady=(0, 4))
+
+tk.Label(master_left, text=f"💾  {SAVE_DIR}", bg="#0a0a0a", fg="#333333",
+         font=("Courier New", 8)).pack(anchor="w", pady=(0, 12))
+
+# Vision Prompt
+tk.Label(master_left, text="VISION PROMPT", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 4))
+vision_prompt_frame = tk.Frame(master_left, bg="#0a0a0a")
+vision_prompt_frame.pack(fill=tk.BOTH, expand=True)
+vision_prompt_text = tk.Text(vision_prompt_frame, bg="#111111", fg="#999999",
     font=("Courier New", 9), relief=tk.FLAT, padx=10, pady=8,
-    wrap=tk.WORD, insertbackground="#00ff88", selectbackground="#003322")
-ps = tk.Scrollbar(prompt_frame, command=prompt_text.yview, bg="#111111")
-prompt_text.configure(yscrollcommand=ps.set)
-ps.pack(side=tk.RIGHT, fill=tk.Y)
-prompt_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-prompt_text.insert(tk.END, DEFAULT_PROMPT)
-prompt_text.bind("<KeyRelease>", schedule_save)
-prompt_text.bind("<<Paste>>",    schedule_save)
+    wrap=tk.WORD, insertbackground="#00ff88", selectbackground="#003322", height=7)
+vps = tk.Scrollbar(vision_prompt_frame, command=vision_prompt_text.yview, bg="#111111")
+vision_prompt_text.configure(yscrollcommand=vps.set)
+vps.pack(side=tk.RIGHT, fill=tk.Y)
+vision_prompt_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+vision_prompt_text.insert(tk.END, DEFAULT_VISION_PROMPT)
+vision_prompt_text.bind("<KeyRelease>", schedule_save)
+vision_prompt_text.bind("<<Paste>>",    schedule_save)
+
+# Text Prompt
+tk.Label(master_left, text="TEXT PROMPT", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(anchor="w", pady=(10, 4))
+text_prompt_frame = tk.Frame(master_left, bg="#0a0a0a")
+text_prompt_frame.pack(fill=tk.BOTH, expand=True)
+text_prompt_text = tk.Text(text_prompt_frame, bg="#111111", fg="#999999",
+    font=("Courier New", 9), relief=tk.FLAT, padx=10, pady=8,
+    wrap=tk.WORD, insertbackground="#00ff88", selectbackground="#003322", height=7)
+tps = tk.Scrollbar(text_prompt_frame, command=text_prompt_text.yview, bg="#111111")
+text_prompt_text.configure(yscrollcommand=tps.set)
+tps.pack(side=tk.RIGHT, fill=tk.Y)
+text_prompt_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+text_prompt_text.insert(tk.END, DEFAULT_TEXT_PROMPT)
+text_prompt_text.bind("<KeyRelease>", schedule_save)
+text_prompt_text.bind("<<Paste>>",    schedule_save)
 
 # ── RIGHT COLUMN — HOME ASSISTANT ────────────
 master_right = tk.Frame(master_cols, bg="#0d0d0d", width=320)
@@ -1204,6 +1307,16 @@ tk.Label(ha_header, text="HOME ASSISTANT", bg="#0d0d0d", fg="#444444",
 ha_status_var = tk.StringVar(value="○ Disconnected")
 tk.Label(ha_header, textvariable=ha_status_var, bg="#0d0d0d", fg="#336633",
          font=("Courier New", 8)).pack(side=tk.LEFT, padx=(8, 0))
+
+# Chicago time clock — updates every second
+ha_clock_var = tk.StringVar(value="")
+tk.Label(ha_header, textvariable=ha_clock_var, bg="#0d0d0d", fg="#3a6a4a",
+         font=("Courier New", 8)).pack(side=tk.RIGHT)
+
+def _update_ha_clock():
+    ha_clock_var.set(datetime.now(CHICAGO_TZ).strftime("%I:%M:%S %p CDT"))
+    root.after(1000, _update_ha_clock)
+_update_ha_clock()
 
 # Scrollable entity list
 ha_canvas = tk.Canvas(master_right, bg="#0d0d0d", highlightthickness=0)
