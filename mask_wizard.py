@@ -3,7 +3,7 @@ mask_wizard.py — Toplevel zone editor: mask (exclusion) rects + 15-ft far zone
 
 Opens a live editor on the most recent buffered frame. Mutates `state` in place:
   state.mask_rects : list[tuple[int, int, int, int]]
-  state.far_zone   : tuple[int, int, int, int] | None
+  state.far_zones  : list[tuple[int, int, int, int]]
 """
 
 import tkinter as tk
@@ -17,7 +17,7 @@ def open_mask_wizard(root, state, frame_buffer, buffer_lock, status_var,
     """
     Args:
       root           — Tk root window
-      state          — object with mutable `mask_rects` list and `far_zone` attribute
+      state          — object with mutable `mask_rects` list and `far_zones` list
       frame_buffer   — deque of (timestamp, jpeg_bytes)
       buffer_lock    — threading.Lock protecting frame_buffer
       status_var     — Tk StringVar for the status bar
@@ -64,8 +64,8 @@ def open_mask_wizard(root, state, frame_buffer, buffer_lock, status_var,
     _mode = {"v": "mask"}
 
     def _info_text():
-        fz = "SET" if state.far_zone else "not set"
-        return (f"{len(state.mask_rects)} mask zone(s)   |   far zone: {fz}"
+        nfz = len(state.far_zones)
+        return (f"{len(state.mask_rects)} mask zone(s)   |   far zones: {nfz}"
                 f"   |   mode: {'MASK ZONE' if _mode['v'] == 'mask' else '15+ FT ZONE'}"
                 f"   |   right-click to delete")
 
@@ -85,16 +85,15 @@ def open_mask_wizard(root, state, frame_buffer, buffer_lock, status_var,
                                text=str(i + 1), fill="#ff4444",
                                font=("Courier New", 9, "bold"))
 
-        # Far zone — no fill, blue outline with label
-        if state.far_zone:
-            fx1, fy1, fx2, fy2 = state.far_zone
+        # Far zones — no fill, blue outline with label
+        for i, (fx1, fy1, fx2, fy2) in enumerate(state.far_zones):
             dx1, dy1 = int(fx1 / scale_x), int(fy1 / scale_y)
             dx2, dy2 = int(fx2 / scale_x), int(fy2 / scale_y)
             canvas.create_rectangle(dx1, dy1, dx2, dy2,
                                     fill="", outline="#4488ff", width=3,
                                     dash=(8, 4))
             canvas.create_text(dx1 + 6, dy1 + 6, anchor="nw",
-                               text="15+ ft zone", fill="#4488ff",
+                               text=f"15+ ft zone {i + 1}", fill="#4488ff",
                                font=("Courier New", 9, "bold"))
 
         info_var.set(_info_text())
@@ -141,18 +140,17 @@ def open_mask_wizard(root, state, frame_buffer, buffer_lock, status_var,
         if _mode["v"] == "mask":
             state.mask_rects.append((nx1, ny1, nx2, ny2))
         else:
-            state.far_zone = (nx1, ny1, nx2, ny2)
+            state.far_zones.append((nx1, ny1, nx2, ny2))
         redraw()
         schedule_save()
 
     def on_right_click(e):
-        # Check far zone first
-        if state.far_zone:
-            fx1, fy1, fx2, fy2 = state.far_zone
+        # Check far zones first
+        for i, (fx1, fy1, fx2, fy2) in enumerate(state.far_zones):
             dx1, dy1 = int(fx1 / scale_x), int(fy1 / scale_y)
             dx2, dy2 = int(fx2 / scale_x), int(fy2 / scale_y)
             if dx1 <= e.x <= dx2 and dy1 <= e.y <= dy2:
-                state.far_zone = None
+                state.far_zones.pop(i)
                 redraw()
                 schedule_save()
                 return
@@ -172,7 +170,7 @@ def open_mask_wizard(root, state, frame_buffer, buffer_lock, status_var,
         schedule_save()
 
     def clear_far():
-        state.far_zone = None
+        state.far_zones.clear()
         redraw()
         schedule_save()
 
@@ -203,7 +201,7 @@ def open_mask_wizard(root, state, frame_buffer, buffer_lock, status_var,
               activebackground="#2a0000", activeforeground="#ff4444", bd=0
               ).pack(side=tk.LEFT, padx=(6, 0))
 
-    tk.Button(btn_row, text="✕  CLEAR FAR ZONE", command=clear_far,
+    tk.Button(btn_row, text="✕  CLEAR FAR ZONES", command=clear_far,
               bg="#111111", fg="#4488ff", font=("Courier New", 9, "bold"),
               relief=tk.FLAT, padx=10, pady=6, cursor="hand2",
               activebackground="#00112a", activeforeground="#4488ff", bd=0

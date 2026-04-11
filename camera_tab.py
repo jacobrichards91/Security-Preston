@@ -61,7 +61,7 @@ class CameraTab:
         self.frame_buffer = collections.deque()
         self.buffer_lock  = threading.Lock()
         self.mask_rects   = []
-        self.far_zone     = None
+        self.far_zones    = []
 
         # ── Stream thread state ───────────────────────────────────────────
         self._stream_running = False
@@ -338,12 +338,13 @@ class CameraTab:
 
     # ── Distance ─────────────────────────────────────────────────────────
     def compute_distance(self, bbox):
-        if self.far_zone is None or bbox is None:
+        if not self.far_zones or bbox is None:
             return None
         x1, y1, x2, y2 = bbox
-        fx1, fy1, fx2, fy2 = self.far_zone
-        if x1 >= fx1 and y1 >= fy1 and x2 <= fx2 and y2 <= fy2:
-            return "more than 15 feet from house"
+        for fz in self.far_zones:
+            fx1, fy1, fx2, fy2 = fz
+            if x1 >= fx1 and y1 >= fy1 and x2 <= fx2 and y2 <= fy2:
+                return "more than 15 feet from house"
         return "closer than 15 feet to house"
 
     # ── Enqueue ───────────────────────────────────────────────────────────
@@ -492,7 +493,7 @@ class CameraTab:
             "crop_padding": self.crop_padding_var.get(),
             "min_box_pct": self.min_box_pct_var.get(),
             "mask_rects":  [list(r) for r in self.mask_rects],
-            "far_zone":    list(self.far_zone) if self.far_zone else None,
+            "far_zones":   [list(z) for z in self.far_zones],
         }
 
     def from_dict(self, data):
@@ -504,8 +505,13 @@ class CameraTab:
         if "buffer_secs"  in data: self.buffer_secs_var.set(data["buffer_secs"])
         if "crop_padding" in data: self.crop_padding_var.set(data["crop_padding"])
         if "min_box_pct"  in data: self.min_box_pct_var.set(data["min_box_pct"])
-        if "mask_rects"   in data:
+        if "mask_rects" in data:
             self.mask_rects.clear()
             self.mask_rects.extend(tuple(r) for r in data["mask_rects"])
-        if data.get("far_zone"):
-            self.far_zone = tuple(data["far_zone"])
+        # Support new "far_zones" list and legacy "far_zone" single value
+        if "far_zones" in data:
+            self.far_zones.clear()
+            self.far_zones.extend(tuple(z) for z in data["far_zones"])
+        elif data.get("far_zone"):
+            self.far_zones.clear()
+            self.far_zones.append(tuple(data["far_zone"]))

@@ -132,19 +132,20 @@ def compute_motion_crop(frame_a_bytes, frame_b_bytes, min_box_pct, crop_padding)
     return cropped_bytes, debug, bbox
 
 
-def compute_distance(bbox, far_zone):
+def compute_distance(bbox, far_zones):
     """
-    Classify a motion bounding box by distance relative to a configured far_zone.
+    Classify a motion bounding box by distance relative to configured far_zones.
 
     Returns:
-      "more than 15 feet from house"  — bbox is entirely inside far_zone
-      "closer than 15 feet to house"  — bbox extends outside far_zone
-      None                            — far_zone not configured or no bbox
+      "more than 15 feet from house"  — bbox is entirely inside any far zone
+      "closer than 15 feet to house"  — bbox is not inside any far zone
+      None                            — no far zones configured or no bbox
     """
-    if far_zone is None or bbox is None:
+    if not far_zones or bbox is None:
         return None
     x1, y1, x2, y2 = bbox
-    fx1, fy1, fx2, fy2 = far_zone
-    if x1 >= fx1 and y1 >= fy1 and x2 <= fx2 and y2 <= fy2:
-        return "more than 15 feet from house"
+    for fz in far_zones:
+        fx1, fy1, fx2, fy2 = fz
+        if x1 >= fx1 and y1 >= fy1 and x2 <= fx2 and y2 <= fy2:
+            return "more than 15 feet from house"
     return "closer than 15 feet to house"

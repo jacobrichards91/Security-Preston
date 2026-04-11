@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import ttk
 import threading
 import base64
+import io
 import time
 import json
 import websocket
@@ -37,6 +38,10 @@ _queue_stage   = ""     # "diff" | "vision" | "judgment" | ""
 
 # --- Camera tabs — list of CameraTab instances (populated as tabs are added) ---
 cameras = []
+
+# In-memory detection history — appended by queue_worker after each completed analysis.
+# Each entry: {ts, cam_name, vision_result, text_result, image_b64}
+detection_history = []
 
 # Placeholder refs for the distance sensor labels in the HA panel (set during UI build)
 distance_dot_lbl = None
@@ -336,6 +341,115 @@ def open_queue_window():
     _refresh_win()
 
 # ---------------------------------------------------------------
+# HISTORY WINDOW
+# ---------------------------------------------------------------
+_history_win = None
+
+def open_history_window():
+    global _history_win
+    if _history_win and _history_win.winfo_exists():
+        _history_win.lift()
+        return
+
+    _history_win = tk.Toplevel(root)
+    _history_win.title("Detection History")
+    _history_win.configure(bg="#0a0a0a")
+    _history_win.geometry("960x580")
+    _history_win.resizable(True, True)
+
+    pane = tk.Frame(_history_win, bg="#0a0a0a")
+    pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+    # ── LEFT: detection list ─────────────────────────────────────────
+    left = tk.Frame(pane, bg="#111111", width=290)
+    left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
+    left.pack_propagate(False)
+
+    count = len(detection_history)
+    tk.Label(left, text=f"DETECTIONS  ({count})", bg="#111111", fg="#444444",
+             font=("Courier New", 8, "bold"), padx=8, pady=6, anchor="w").pack(fill=tk.X)
+
+    list_frame = tk.Frame(left, bg="#111111")
+    list_frame.pack(fill=tk.BOTH, expand=True)
+    listbox = tk.Listbox(list_frame, bg="#111111", fg="#888888",
+                         font=("Courier New", 9), relief=tk.FLAT,
+                         selectbackground="#003322", selectforeground="#00ff88",
+                         activestyle="none", borderwidth=0, highlightthickness=0)
+    list_scr = tk.Scrollbar(list_frame, command=listbox.yview, bg="#111111")
+    listbox.configure(yscrollcommand=list_scr.set)
+    list_scr.pack(side=tk.RIGHT, fill=tk.Y)
+    listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    for entry in reversed(detection_history):   # newest first
+        listbox.insert(tk.END, f"  {entry['ts']}  [{entry['cam_name']}]")
+
+    if not detection_history:
+        listbox.insert(tk.END, "  — no detections yet —")
+
+    # ── RIGHT: detail panel ──────────────────────────────────────────
+    right = tk.Frame(pane, bg="#0a0a0a")
+    right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    detail_img_lbl = tk.Label(right, bg="#111111", text="—", fg="#333333",
+                               font=("Courier New", 8), width=28, height=8, anchor="center")
+    detail_img_lbl.pack(anchor="nw", pady=(0, 6))
+
+    def _make_txt(parent, title, font_size=9, fg="#888888", height=5):
+        tk.Label(parent, text=title, bg="#0a0a0a", fg="#444444",
+                 font=("Courier New", 8, "bold")).pack(anchor="w")
+        frm = tk.Frame(parent, bg="#0a0a0a")
+        frm.pack(fill=tk.BOTH, expand=True, pady=(2, 6))
+        txt = tk.Text(frm, bg="#111111", fg=fg,
+                      font=("Courier New", font_size), relief=tk.FLAT,
+                      padx=6, pady=6, wrap=tk.WORD,
+                      state=tk.DISABLED, selectbackground="#003322", height=height)
+        scr = tk.Scrollbar(frm, command=txt.yview, bg="#111111")
+        txt.configure(yscrollcommand=scr.set)
+        scr.pack(side=tk.RIGHT, fill=tk.Y)
+        txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        return txt
+
+    vision_txt = _make_txt(right, "VISION",   font_size=8, fg="#666666", height=5)
+    judg_txt   = _make_txt(right, "JUDGMENT", font_size=9, fg="#e0e0e0", height=6)
+
+    def _on_select(evt):
+        sel = listbox.curselection()
+        if not sel or not detection_history:
+            return
+        idx = len(detection_history) - 1 - sel[0]   # newest-first mapping
+        if idx < 0 or idx >= len(detection_history):
+            return
+        entry = detection_history[idx]
+
+        img_b64 = entry.get("image_b64")
+        if img_b64:
+            try:
+                img = Image.open(io.BytesIO(base64.b64decode(img_b64)))
+                img.thumbnail((220, 150), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(img)
+                detail_img_lbl.config(image=photo, text="",
+                                      width=img.width, height=img.height)
+                detail_img_lbl.image = photo
+            except Exception:
+                detail_img_lbl.config(image="", text="—")
+        else:
+            detail_img_lbl.config(image="", text="—")
+
+        def _set(w, text):
+            w.config(state=tk.NORMAL)
+            w.delete("1.0", tk.END)
+            w.insert(tk.END, text)
+            w.config(state=tk.DISABLED)
+
+        _set(vision_txt, entry.get("vision_result", ""))
+        _set(judg_txt,   entry.get("text_result",   ""))
+
+    listbox.bind("<<ListboxSelect>>", _on_select)
+    if detection_history:
+        listbox.selection_set(0)
+        listbox.event_generate("<<ListboxSelect>>")
+
+# ---------------------------------------------------------------
 # QUEUE WORKER
 # ---------------------------------------------------------------
 def _set_stage(stage, ts_str=""):
@@ -382,6 +496,13 @@ def queue_worker():
 
                 _b = item["image_b64"]
                 _ti = full_text_prompt
+                detection_history.append({
+                    "ts":            ts_str,
+                    "cam_name":      cam.cam_name_var.get() if cam is not None else "—",
+                    "vision_result": vision_result,
+                    "text_result":   text_result,
+                    "image_b64":     _b,
+                })
                 if cam is not None:
                     root.after(0, lambda b=_b, vr=vision_result, ti=_ti, tr=text_result,
                                         t=ts_str, e=elapsed, c=cam:
@@ -399,9 +520,9 @@ def queue_worker():
                 continue
 
             # Motion tuning comes from the originating camera's own settings.
-            mb_pct   = cam.min_box_pct_var.get() if cam is not None else 0.05
-            pad_px   = cam.crop_padding_var.get() if cam is not None else 50
-            far_zone = cam.far_zone if cam is not None else None
+            mb_pct    = cam.min_box_pct_var.get() if cam is not None else 0.05
+            pad_px    = cam.crop_padding_var.get() if cam is not None else 50
+            far_zones = cam.far_zones if cam is not None else []
 
             _set_stage("diff", ts_str)
             cropped_bytes, debug_imgs, bbox = compute_motion_crop(
@@ -419,7 +540,7 @@ def queue_worker():
             if cam is not None:
                 root.after(0, lambda b=crop_b64, c=cam: c.show_detected_image(b))
 
-            distance = compute_distance(bbox, far_zone)
+            distance = compute_distance(bbox, far_zones)
             if distance:
                 root.after(0, lambda d=distance: _update_distance_display(d))
 
@@ -442,6 +563,13 @@ def queue_worker():
 
             _b64 = crop_b64
             _ti  = full_text_prompt
+            detection_history.append({
+                "ts":            ts_str,
+                "cam_name":      cam.cam_name_var.get() if cam is not None else "—",
+                "vision_result": vision_result,
+                "text_result":   text_result,
+                "image_b64":     _b64,
+            })
             if cam is not None:
                 root.after(0, lambda b=_b64, vr=vision_result, ti=_ti, tr=text_result,
                                     t=ts_str, e=elapsed, c=cam:
@@ -955,8 +1083,15 @@ tk.Frame(tab_master, bg="#222222", height=1).pack(fill=tk.X, padx=14, pady=(4, 0
 det_outer = tk.Frame(tab_master, bg="#0a0a0a")
 det_outer.pack(fill=tk.BOTH, expand=True, padx=14, pady=(6, 10))
 
-tk.Label(det_outer, text="LAST DETECTION", bg="#0a0a0a", fg="#444444",
-         font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 6))
+_det_hdr = tk.Frame(det_outer, bg="#0a0a0a")
+_det_hdr.pack(fill=tk.X, pady=(0, 6))
+tk.Label(_det_hdr, text="LAST DETECTION", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(side=tk.LEFT)
+tk.Button(_det_hdr, text="📋  HISTORY", command=open_history_window,
+          bg="#111111", fg="#666666", font=("Courier New", 8, "bold"),
+          relief=tk.FLAT, padx=8, pady=3, cursor="hand2",
+          activebackground="#1a1a1a", activeforeground="#00ff88", bd=0
+          ).pack(side=tk.RIGHT)
 
 det_inner = tk.Frame(det_outer, bg="#0a0a0a")
 det_inner.pack(fill=tk.BOTH, expand=True)
@@ -1033,12 +1168,11 @@ def add_camera_tab(initial_data=None, autostart=False):
         print(f"[Camera] Failed to build tab: {e}")
         return None
 
-    # Insert the new tab right before Master. Master moves one slot to the right,
-    # "+" stays at the very end.
-    master_pos = notebook.index(tab_master)
-    tab_name   = (initial_data.get("cam_name") if initial_data else None) \
-                 or f"Camera {len(cameras) + 1}"
-    notebook.insert(master_pos, cam.tab_frame, text=tab_name)
+    # Insert the new tab just before '+'. Master stays at the far left.
+    plus_pos = notebook.index(_plus_tab)
+    tab_name = (initial_data.get("cam_name") if initial_data else None) \
+               or f"Camera {len(cameras) + 1}"
+    notebook.insert(plus_pos, cam.tab_frame, text=tab_name)
 
     cameras.append(cam)
 
