@@ -62,15 +62,13 @@ def grab_raw_frame():
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
             tmp_path = tmp.name
         cmd = [
-            "ffmpeg", "-y",
+            "ffmpeg",
             "-rtsp_transport", "tcp",
-            "-stimeout", "5000000",      # 5s socket timeout (microseconds)
-            "-timeout", "5000000",        # 5s connection timeout (microseconds)
-            "-allowed_extensions", "all",
             "-i", RTSP_URL,
             "-frames:v", "1",
             "-q:v", "2",
-            "-f", "image2",
+            "-update", "1",
+            "-y",
             tmp_path
         ]
         stderr_pipe = None if DEBUG_MODE else subprocess.DEVNULL
