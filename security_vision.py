@@ -1,123 +1,41 @@
 import tkinter as tk
 from tkinter import filedialog, ttk
 import threading
-import queue
-import heapq
-import re
-import requests
 import base64
 import time
-import os
 import collections
 import io
 import json
+import types
 import websocket
 import numpy as np
 import cv2
-from PIL import Image, ImageTk, ImageDraw
-from pathlib import Path
-from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
+from PIL import Image, ImageTk
+from datetime import datetime
 from flask import Flask, request
 import logging
 
-# --- Config ---
-OLLAMA_URL = "http://localhost:11434/api/generate"
-DEFAULT_VISION_MODEL = "minicpm-v:latest"
-DEFAULT_TEXT_MODEL   = "minicpm-v:latest"
-
-# On Windows, zoneinfo needs the tzdata package: pip install tzdata
-try:
-    CHICAGO_TZ = ZoneInfo("America/Chicago")
-except Exception:
-    print("[Warning] tzdata not installed — run: pip install tzdata")
-    print("[Warning] Falling back to UTC-5 (CDT). Install tzdata for correct DST handling.")
-    CHICAGO_TZ = timezone(timedelta(hours=-5))
-WEBHOOK_PORT = 8765
-SAVE_DIR = Path(os.path.expanduser("~")) / "SecurityEvents"
-SAVE_DIR.mkdir(exist_ok=True)
-CONFIG_PATH = Path.home() / "Documents" / "GitHub" / "security_preston_config.json"
-CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-RTSP_URL = "rtsp://192.168.0.166:7447/YD4arutidcyKjQvI"
-STREAM_PREVIEW_INTERVAL = 3000  # ms between live preview refreshes
-
-# Buffer config — defaults (live values come from UI vars after root is created)
-BUFFER_SECONDS = 3.0          # how many seconds of frames to keep
-FRAME_INTERVAL = 0.2          # grab a frame every N seconds for buffer (not tunable)
-SNAP_BEFORE_SECS = 2.5        # frame A: this many seconds before the trigger
-SNAP_AFTER_SECS  = 2.0        # frame B: this many seconds before the trigger (closer)
-MIN_BOX_PCT = 0.05            # minimum contour size as % of frame area
+from constants import (
+    OLLAMA_URL, DEFAULT_VISION_MODEL, DEFAULT_TEXT_MODEL,
+    CHICAGO_TZ, WEBHOOK_PORT, SAVE_DIR, CONFIG_PATH, RTSP_URL,
+    STREAM_PREVIEW_INTERVAL, BUFFER_SECONDS, FRAME_INTERVAL,
+    SNAP_BEFORE_SECS, SNAP_AFTER_SECS, MIN_BOX_PCT, CROP_PADDING,
+    DEBUG_MODE, DEFAULT_VISION_PROMPT, DEFAULT_TEXT_PROMPT,
+    HA_HOST, HA_TOKEN, WATCHED_ENTITIES, HA_NAMES, HA_GROUPS,
+)
+from priority_queue import NewestFirstQueue
+from motion import jpeg_apply_mask, compute_motion_crop, compute_distance
+from ollama_api import fmt_size, list_models, warmup, analyze_image_bytes, analyze_text
+from synthetic_sensors import SyntheticSensors
+from mask_wizard import open_mask_wizard as _open_mask_wizard
 
 system_active = threading.Event()
 system_active.set()           # ON by default
-CROP_PADDING = 50             # px padding around bounding box (default, overridden by UI var)
-
-DEBUG_MODE = True             # show debug windows
-
-DEFAULT_VISION_PROMPT = """You are a security camera analyzer. Look for people, vehicles, and animals ONLY.
-
-For each one found, describe: count, type, appearance, and behavior.
-
-If none are present, respond with only: CLEAR"""
-
-DEFAULT_TEXT_PROMPT = """You are a home security analyst with full situational awareness of the house.
-
-You will receive:
-1. The current date and time (Chicago)
-2. The live state of all sensors, doors, locks, and occupancy in the home
-3. A visual description from a security camera that just detected motion
-
-Based on ALL of this context, provide a concise security assessment:
-- What was detected and is it expected given the time and home state?
-- Is this benign (resident, pet, expected visitor) or suspicious?
-- Any recommended action?
-
-Be brief and direct. If clearly benign, say so."""
 
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 
-# ---------------------------------------------------------------
-# PRIORITY QUEUE  (newest-first — most recent detection processed first)
-# ---------------------------------------------------------------
-class NewestFirstQueue:
-    """Thread-safe priority queue: highest timestamp = processed first."""
-    def __init__(self):
-        self._heap    = []          # (neg_ts, seq, item)
-        self._lock    = threading.Condition()
-        self._seq     = 0
-        self._all     = []          # parallel list for display (newest first)
-
-    def put(self, item, ts):
-        with self._lock:
-            heapq.heappush(self._heap, (-ts, self._seq, item))
-            self._seq += 1
-            # rebuild display list sorted newest→oldest
-            self._all = [i for (_, _, i) in sorted(self._heap)]
-            self._lock.notify()
-
-    def get(self):
-        """Block until an item is available, return it (newest first)."""
-        with self._lock:
-            while not self._heap:
-                self._lock.wait()
-            _, _, item = heapq.heappop(self._heap)
-            self._all = [i for (_, _, i) in sorted(self._heap)]
-            return item
-
-    def peek_all(self):
-        """Return waiting items sorted newest → oldest (for display only)."""
-        with self._lock:
-            return list(self._all)
-
-    def qsize(self):
-        with self._lock:
-            return len(self._heap)
-
-    def task_done(self):
-        pass  # compatibility shim
-
+# --- Priority queue for detection events (imported from priority_queue.py) ---
 analysis_queue = NewestFirstQueue()
 
 # State exposed to the queue-detail popup
@@ -128,13 +46,9 @@ _queue_stage   = ""     # "diff" | "vision" | "judgment" | ""
 frame_buffer = collections.deque()
 buffer_lock  = threading.Lock()
 
-# --- Area exclusion mask: list of (x1, y1, x2, y2) in native frame pixels ---
-mask_rects = []
-
-# --- Distance reference zone: single (x1,y1,x2,y2) in native pixels.
-#     If the motion bbox fits entirely inside this zone → "far from house".
-#     Does NOT paint black — only used for distance classification. ---
-far_zone = None
+# --- Zone state — mask_rects (list of exclusion rects) and far_zone (distance ref).
+#     Wrapped in a SimpleNamespace so mask_wizard and config can mutate attributes. ---
+cam_state = types.SimpleNamespace(mask_rects=[], far_zone=None)
 
 # Placeholder refs for the distance sensor labels in the HA panel (set during UI build)
 distance_dot_lbl = None
@@ -146,259 +60,12 @@ _model_info = {}
 vision_model_info_lbl = None
 text_model_info_lbl   = None
 
-# ---------------------------------------------------------------
-# SYNTHETIC SENSORS  (derived from vision model output)
-# ---------------------------------------------------------------
-_synth         = {"child": False, "jacob": False, "lauren": False}
-_child_timer   = None   # threading.Timer — auto-off after 5 min
-_jacob_timer   = None
-_lauren_timer  = None
-
-# UI label refs (assigned during HA panel build)
-synth_child_dot  = None;  synth_child_val  = None
-synth_jacob_dot  = None;  synth_jacob_val  = None
-synth_lauren_dot = None;  synth_lauren_val = None
-synth_emerg_dot  = None;  synth_emerg_val  = None
-
-# --- Keywords / patterns ---
-_CHILD_KEYWORDS = [
-    "child", "children", "baby", "babies", "toddler", "toddlers",
-    "infant", "infants", "kid ", "kids ", "young child", "small child",
-    "little one", "little ones", "youngster", "youngsters", "minor",
-]
-
-# Jacob: man with brown / black / dark hair (gated on jacob_is_home)
-_JACOB_PATTERNS = [re.compile(p, re.IGNORECASE) for p in [
-    r"man.{0,50}brown\s*hair",                 r"brown\s*hair.{0,50}man",
-    r"man.{0,50}black\s*hair",                 r"black\s*hair.{0,50}man",
-    r"man.{0,50}dark\s*hair",                  r"dark\s*hair.{0,50}man",
-    r"male.{0,50}brown\s*hair",                r"brown\s*hair.{0,50}male",
-    r"male.{0,50}black\s*hair",                r"black\s*hair.{0,50}male",
-    r"male.{0,50}dark\s*hair",                 r"dark\s*hair.{0,50}male",
-    r"guy.{0,50}(brown|black|dark)\s*hair",    r"(brown|black|dark)\s*hair.{0,50}guy",
-    r"brown[\-\s]haired\s+\w*\s*(man|male|guy|gentleman)",
-    r"black[\-\s]haired\s+\w*\s*(man|male|guy|gentleman)",
-    r"dark[\-\s]haired\s+\w*\s*(man|male|guy|gentleman)",
-    r"(man|male|guy)\s+\w*\s*brown[\-\s]hair",
-    r"(man|male|guy)\s+\w*\s*black[\-\s]hair",
-    r"(man|male|guy)\s+\w*\s*dark[\-\s]hair",
-    r"adult\s+male.{0,50}(brown|black|dark)\s*hair",
-    r"(brown|black|dark)\s*hair.{0,50}adult\s+male",
-    r"man\s+with\s+(short|long|medium|curly|straight|wavy)?\s*(brown|black|dark)\s*hair",
-    r"(brown|black|dark)[\-\s]haired\s+adult",
-    r"individual.{0,30}man.{0,30}(brown|black|dark)\s*hair",
-    r"person.{0,20}appears\s+to\s+be\s+(a\s+)?male.{0,50}(brown|black|dark)\s*hair",
-]]
-
-# Lauren: woman with brown/dark hair OR woman aged 20-35 (gated on lauren_is_home)
-_LAUREN_PATTERNS = [re.compile(p, re.IGNORECASE) for p in [
-    # Brown / dark hair
-    r"woman.{0,50}brown\s*hair",               r"brown\s*hair.{0,50}woman",
-    r"female.{0,50}brown\s*hair",              r"brown\s*hair.{0,50}female",
-    r"lady.{0,50}brown\s*hair",                r"brown\s*hair.{0,50}lady",
-    r"girl.{0,50}brown\s*hair",                r"brown\s*hair.{0,50}girl",
-    r"woman.{0,50}dark\s*hair",                r"dark\s*hair.{0,50}woman",
-    r"female.{0,50}dark\s*hair",               r"dark\s*hair.{0,50}female",
-    r"brunette",
-    r"brown[\-\s]haired\s+\w*\s*(woman|female|lady|girl)",
-    r"dark[\-\s]haired\s+\w*\s*(woman|female|lady|girl)",
-    r"(woman|female|lady|girl)\s+\w*\s*brown[\-\s]hair",
-    r"adult\s+female.{0,50}(brown|dark)\s*hair",
-    r"(brown|dark)\s*hair.{0,50}adult\s+female",
-    r"woman\s+with\s+(short|long|medium|curly|straight|wavy)?\s*(brown|dark)\s*hair",
-    # Age 20-35
-    r"woman.{0,40}(in her |aged? )?(20s|twenties|30s|thirties)",
-    r"(20s|twenties|30s|thirties).{0,40}woman",
-    r"female.{0,40}(in her |aged? )?(20s|twenties|30s|thirties)",
-    r"(20s|twenties|30s|thirties).{0,40}female",
-    r"(woman|female|lady).{0,30}mid[\-\s]?(twenties|20s)",
-    r"(woman|female|lady).{0,30}late[\-\s]?(twenties|20s)",
-    r"(woman|female|lady).{0,30}early[\-\s]?(thirties|30s)",
-    r"(woman|female|lady).{0,30}mid[\-\s]?(thirties|30s)",
-    r"20[\-\s]?something.{0,30}(woman|female|lady)",
-    r"30[\-\s]?something.{0,30}(woman|female|lady)",
-    r"(woman|female|lady).{0,30}20[\-\s]?something",
-    r"(woman|female|lady).{0,30}30[\-\s]?something",
-    r"young\s+adult\s+(woman|female|lady)",
-    r"(woman|female|lady).{0,20}young\s+adult",
-    # Numeric age 20-35
-    r"(woman|female|lady).{0,40}(approximately|about|around|age\s+)?(2[0-9]|3[0-5])\s*(year|yr|y\.?o)",
-    r"(approximately|about|around|age\s+)?(2[0-9]|3[0-5])\s*(year|yr|y\.?o).{0,40}(woman|female|lady)",
-    r"(woman|female).{0,40}between\s+\d+\s+and\s+3[0-5]",
-    r"(woman|female).{0,40}appears\s+to\s+be\s+(in\s+her\s+)?(20|25|30|35)",
-]]
-
-
-def _apply_synth_row(dot, val, active, text, alert=False):
-    if dot is None:
-        return
-    if alert and active:
-        dot.config(text="●", fg="#ff2222")
-        val.config(text=text, fg="#ff2222")
-    elif active:
-        dot.config(text="●", fg="#00ff88")
-        val.config(text=text, fg="#00ff88")
-    else:
-        dot.config(text="○", fg="#444444")
-        val.config(text=text, fg="#666666")
-
-
-def _refresh_synth_ui():
-    """Recompute derived states and update all 4 synthetic sensor rows. Main thread only."""
-    child  = _synth["child"]
-    jacob  = _synth["jacob"]
-    lauren = _synth["lauren"]
-    emerg  = child and not (jacob or lauren)
-    _apply_synth_row(synth_child_dot,  synth_child_val,
-                     child,  "detected" if child  else "clear")
-    _apply_synth_row(synth_jacob_dot,  synth_jacob_val,
-                     jacob,  "detected" if jacob  else "clear")
-    _apply_synth_row(synth_lauren_dot, synth_lauren_val,
-                     lauren, "detected" if lauren else "clear")
-    _apply_synth_row(synth_emerg_dot,  synth_emerg_val,
-                     emerg,  "ACTIVE"   if emerg  else "clear", alert=emerg)
-
-
-def _set_synth(key, value):
-    """Set one synthetic sensor flag and refresh UI. Must run on main thread."""
-    _synth[key] = value
-    _refresh_synth_ui()
-
-
-def _arm_timer(key, timer_ref_name):
-    """Cancel existing timer for key and start a fresh 5-minute auto-off."""
-    import sys
-    old = globals().get(timer_ref_name)
-    if old:
-        old.cancel()
-    t = threading.Timer(300, lambda: root.after(0, lambda: _set_synth(key, False)))
-    t.daemon = True
-    t.start()
-    globals()[timer_ref_name] = t
-
-
-def check_synthetic_sensors(vision_result):
-    """
-    Parse vision model output and update synthetic sensors.
-    Jacob/Lauren are gated on their respective HA home-presence sensor.
-    Safe to call from any thread — UI updates marshalled via root.after.
-    """
-    text = vision_result.lower()
-
-    # --- Child (no HA gate) ---
-    if any(kw in text for kw in _CHILD_KEYWORDS):
-        _arm_timer("child", "_child_timer")
-        root.after(0, lambda: _set_synth("child", True))
-
-    # --- Jacob: man with brown/black/dark hair, only if jacob_is_home=on ---
-    if ha_state.get("input_boolean.jacob_is_home", "off") == "on":
-        if any(p.search(text) for p in _JACOB_PATTERNS):
-            _arm_timer("jacob", "_jacob_timer")
-            root.after(0, lambda: _set_synth("jacob", True))
-
-    # --- Lauren: woman (brown hair OR aged 20-35), only if lauren_is_home=on ---
-    if ha_state.get("input_boolean.lauren_is_home", "off") == "on":
-        if any(p.search(text) for p in _LAUREN_PATTERNS):
-            _arm_timer("lauren", "_lauren_timer")
-            root.after(0, lambda: _set_synth("lauren", True))
-
-# ---------------------------------------------------------------
-# HOME ASSISTANT CONFIG
-# ---------------------------------------------------------------
-HA_HOST  = "192.168.0.209"
-HA_TOKEN = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
-            ".eyJpc3MiOiJmMjNkMzE4Nzc1OWY0ZTQ4YTZmOWZhNTYyNjc2ZTE1ZCIsImlhdCI6MTc3NT"
-            "kyMTcxMiwiZXhwIjoyMDkxMjgxNzEyfQ"
-            ".rfCWpPO1-eaeHHlblGrhO4XzzDZtPT1BIMeV5piaEaQ")
-
-WATCHED_ENTITIES = {
-    # Occupancy
-    "binary_sensor.house_occupied_3",
-    "input_boolean.jacob_is_home",
-    "input_boolean.lauren_is_home",
-    # Doors
-    "binary_sensor.front_door_door",
-    "binary_sensor.aqara_door_and_window_sensor_p2_door",
-    "binary_sensor.garage_door_door",
-    # Locks
-    "lock.aqara_smart_lock_u100",
-    "lock.aqara_smart_lock_u100_2",
-    # Garage
-    "cover.smart_garage_door_opener_msg100_main_channel",
-    # Person detected
-    "binary_sensor.side_henrys_room_person_detected",
-    "binary_sensor.front_person_detected",
-    "binary_sensor.front_door_person_detected",
-    "binary_sensor.side_yard_cul_de_sac_person_detected",
-    "binary_sensor.side_yard_street_person_detected",
-    "binary_sensor.patio2_person_detected",
-    "binary_sensor.backyard_person_detected",
-    # Animal detected
-    "binary_sensor.front_animal_detected",
-    "binary_sensor.side_henrys_room_animal_detected",
-    "binary_sensor.front_door_animal_detected",
-    "binary_sensor.side_yard_cul_de_sac_animal_detected",
-    "binary_sensor.side_yard_street_animal_detected",
-    "binary_sensor.patio2_animal_detected",
-    "binary_sensor.backyard_animal_detected",
-}
-
-# Short display names for each entity
-HA_NAMES = {
-    "binary_sensor.house_occupied_3":                         "house occupied",
-    "input_boolean.jacob_is_home":                            "jacob home",
-    "input_boolean.lauren_is_home":                           "lauren home",
-    "binary_sensor.front_door_door":                          "front door",
-    "binary_sensor.aqara_door_and_window_sensor_p2_door":     "back door",
-    "binary_sensor.garage_door_door":                         "garage door",
-    "lock.aqara_smart_lock_u100":                             "lock u100",
-    "lock.aqara_smart_lock_u100_2":                           "lock u100 2",
-    "cover.smart_garage_door_opener_msg100_main_channel":     "garage cover",
-    "binary_sensor.side_henrys_room_person_detected":         "henry's room",
-    "binary_sensor.front_person_detected":                    "front",
-    "binary_sensor.front_door_person_detected":               "front door",
-    "binary_sensor.side_yard_cul_de_sac_person_detected":     "cul-de-sac",
-    "binary_sensor.side_yard_street_person_detected":         "street",
-    "binary_sensor.patio2_person_detected":                   "patio",
-    "binary_sensor.backyard_person_detected":                 "backyard",
-    "binary_sensor.front_animal_detected":                    "front",
-    "binary_sensor.side_henrys_room_animal_detected":         "henry's room",
-    "binary_sensor.front_door_animal_detected":               "front door",
-    "binary_sensor.side_yard_cul_de_sac_animal_detected":     "cul-de-sac",
-    "binary_sensor.side_yard_street_animal_detected":         "street",
-    "binary_sensor.patio2_animal_detected":                   "patio",
-    "binary_sensor.backyard_animal_detected":                 "backyard",
-}
-
-# Groups for display order
-HA_GROUPS = [
-    ("OCCUPANCY",        ["binary_sensor.house_occupied_3",
-                          "input_boolean.jacob_is_home",
-                          "input_boolean.lauren_is_home"]),
-    ("DOORS",            ["binary_sensor.front_door_door",
-                          "binary_sensor.aqara_door_and_window_sensor_p2_door",
-                          "binary_sensor.garage_door_door"]),
-    ("LOCKS",            ["lock.aqara_smart_lock_u100",
-                          "lock.aqara_smart_lock_u100_2"]),
-    ("GARAGE",           ["cover.smart_garage_door_opener_msg100_main_channel"]),
-    ("PERSON DETECTED",  ["binary_sensor.front_person_detected",
-                          "binary_sensor.front_door_person_detected",
-                          "binary_sensor.side_henrys_room_person_detected",
-                          "binary_sensor.side_yard_cul_de_sac_person_detected",
-                          "binary_sensor.side_yard_street_person_detected",
-                          "binary_sensor.patio2_person_detected",
-                          "binary_sensor.backyard_person_detected"]),
-    ("ANIMAL DETECTED",  ["binary_sensor.front_animal_detected",
-                          "binary_sensor.front_door_animal_detected",
-                          "binary_sensor.side_henrys_room_animal_detected",
-                          "binary_sensor.side_yard_cul_de_sac_animal_detected",
-                          "binary_sensor.side_yard_street_animal_detected",
-                          "binary_sensor.patio2_animal_detected",
-                          "binary_sensor.backyard_animal_detected"]),
-]
-
+# --- Home Assistant live state (populated by ha_worker) ---
 ha_state      = {}          # entity_id -> state string
 ha_row_labels = {}          # entity_id -> {"dot": Label, "val": Label}
+
+# Synthetic sensors — instance created after root exists (see below)
+synth = None
 
 # ---------------------------------------------------------------
 # FRAME BUFFER WORKER
@@ -473,43 +140,6 @@ def get_frame_at(target_ts):
         best = min(frame_buffer, key=lambda x: abs(x[0] - target_ts))
         return best[1]
 
-def apply_mask(img_bgr):
-    """Paint black over every rect in mask_rects. Operates in-place on a copy."""
-    if not mask_rects:
-        return img_bgr
-    out = img_bgr.copy()
-    for (x1, y1, x2, y2) in mask_rects:
-        out[y1:y2, x1:x2] = 0
-    return out
-
-def jpeg_apply_mask(jpeg_bytes):
-    """Decode JPEG bytes → apply mask → re-encode. Returns bytes."""
-    arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        return jpeg_bytes
-    img = apply_mask(img)
-    _, enc = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 92])
-    return enc.tobytes()
-
-# ---------------------------------------------------------------
-# DISTANCE DETECTION
-# ---------------------------------------------------------------
-def compute_distance(bbox):
-    """
-    Returns:
-      "more than 15 feet from house"  — bbox is entirely inside far_zone
-      "closer than 15 feet to house"  — bbox exists but extends outside far_zone
-      None                            — far_zone not configured or no bbox
-    """
-    if far_zone is None or bbox is None:
-        return None
-    x1, y1, x2, y2 = bbox
-    fx1, fy1, fx2, fy2 = far_zone
-    if x1 >= fx1 and y1 >= fy1 and x2 <= fx2 and y2 <= fy2:
-        return "more than 15 feet from house"
-    return "closer than 15 feet to house"
-
 def _update_distance_display(distance):
     """Update the distance sensor row in the HA panel (must run on main thread)."""
     if distance_dot_lbl is None:
@@ -523,108 +153,6 @@ def _update_distance_display(distance):
         text="close  <15ft" if is_close else "far  >15ft",
         fg="#ff8800" if is_close else "#00ff88"
     )
-
-# ---------------------------------------------------------------
-# MOTION DETECTION & BOUNDING BOX
-# ---------------------------------------------------------------
-def compute_motion_crop(frame_a_bytes, frame_b_bytes):
-    """
-    Diff two JPEG frames. Returns:
-      - cropped_bytes: JPEG of the motion crop from frame_b
-      - debug_images: dict of labeled PIL images for debug view
-      - bbox: (x1, y1, x2, y2) or None
-    """
-    # Decode to numpy
-    arr_a = np.frombuffer(frame_a_bytes, dtype=np.uint8)
-    arr_b = np.frombuffer(frame_b_bytes, dtype=np.uint8)
-    img_a = cv2.imdecode(arr_a, cv2.IMREAD_COLOR)
-    img_b = cv2.imdecode(arr_b, cv2.IMREAD_COLOR)
-
-    if img_a is None or img_b is None:
-        return None, {}, None
-
-    # Resize to same size if different (shouldn't happen but safety)
-    if img_a.shape != img_b.shape:
-        img_b = cv2.resize(img_b, (img_a.shape[1], img_a.shape[0]))
-
-    h, w = img_a.shape[:2]
-
-    # Grayscale
-    gray_a = cv2.cvtColor(img_a, cv2.COLOR_BGR2GRAY)
-    gray_b = cv2.cvtColor(img_b, cv2.COLOR_BGR2GRAY)
-
-    # Gaussian blur to reduce noise
-    blur_a = cv2.GaussianBlur(gray_a, (21, 21), 0)
-    blur_b = cv2.GaussianBlur(gray_b, (21, 21), 0)
-
-    # Absolute diff
-    diff = cv2.absdiff(blur_a, blur_b)
-
-    # Threshold
-    _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
-
-    # Dilate to fill gaps
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    dilated = cv2.dilate(thresh, kernel, iterations=2)
-
-    # Find contours
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    # Filter small noise contours (< 0.05% of frame area)
-    min_area = w * h * (min_box_pct_var.get() / 100.0)
-    contours = [c for c in contours if cv2.contourArea(c) > min_area]
-
-    bbox = None
-    cropped_bytes = None
-
-    if contours:
-        # Bounding box enclosing all motion contours
-        x1 = min(cv2.boundingRect(c)[0] for c in contours)
-        y1 = min(cv2.boundingRect(c)[1] for c in contours)
-        x2 = max(cv2.boundingRect(c)[0] + cv2.boundingRect(c)[2] for c in contours)
-        y2 = max(cv2.boundingRect(c)[1] + cv2.boundingRect(c)[3] for c in contours)
-
-        # Add padding, clamp to frame
-        pad = int(crop_padding_var.get())
-        x1p = max(0, x1 - pad)
-        y1p = max(0, y1 - pad)
-        x2p = min(w, x2 + pad)
-        y2p = min(h, y2 + pad)
-        bbox = (x1p, y1p, x2p, y2p)
-
-        # Crop from frame_b
-        crop = img_b[y1p:y2p, x1p:x2p]
-        _, crop_enc = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
-        cropped_bytes = crop_enc.tobytes()
-
-    # --- Debug images ---
-    debug = {}
-
-    def cv2_to_pil(img, gray=False):
-        if gray:
-            return Image.fromarray(img)
-        return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-
-    debug["Frame A\n(t-1s)"] = cv2_to_pil(img_a)
-    debug["Frame B\n(t+0.5s)"] = cv2_to_pil(img_b)
-    debug["Diff"] = cv2_to_pil(diff, gray=True)
-    debug["Threshold"] = cv2_to_pil(thresh, gray=True)
-    debug["Dilated\nmask"] = cv2_to_pil(dilated, gray=True)
-
-    # Draw bounding box on frame B copy
-    img_b_annot = img_b.copy()
-    if bbox:
-        x1p, y1p, x2p, y2p = bbox
-        cv2.rectangle(img_b_annot, (x1p, y1p), (x2p, y2p), (0, 255, 0), 3)
-        # Draw all contours in red
-        cv2.drawContours(img_b_annot, contours, -1, (0, 0, 255), 2)
-    debug["Bounding\nbox"] = cv2_to_pil(img_b_annot)
-
-    if cropped_bytes:
-        crop_pil = Image.open(io.BytesIO(cropped_bytes))
-        debug["AI\nCrop"] = crop_pil
-
-    return cropped_bytes, debug, bbox
 
 # ---------------------------------------------------------------
 # DEBUG WINDOW
@@ -698,12 +226,6 @@ def save_event_background(frame_a, frame_b, cropped, description, bbox, ts):
 # ---------------------------------------------------------------
 # OLLAMA
 # ---------------------------------------------------------------
-def _fmt_size(gb):
-    """Format GB value as human-readable string."""
-    if gb >= 1.0:
-        return f"{gb:.1f} GB"
-    return f"{gb * 1024:.0f} MB"
-
 def _update_model_info_labels(*_):
     """Refresh the per-model info labels in the Master tab after a selection change."""
     for var, lbl in [(vision_model_var, vision_model_info_lbl),
@@ -716,7 +238,7 @@ def _update_model_info_labels(*_):
             if info.get("param_size"):
                 parts.append(info["param_size"])
             if info.get("size_gb", 0) > 0:
-                parts.append(_fmt_size(info["size_gb"]))
+                parts.append(fmt_size(info["size_gb"]))
             if info.get("quantization"):
                 parts.append(info["quantization"])
             if info.get("family"):
@@ -728,27 +250,14 @@ def _update_model_info_labels(*_):
 def fetch_models():
     global _model_info
     try:
-        resp = requests.get("http://localhost:11434/api/tags", timeout=10)
-        resp.raise_for_status()
-        raw = resp.json().get("models", [])
-
-        # Parse full metadata
         _model_info.clear()
-        for m in raw:
-            name    = m.get("name", "")
-            details = m.get("details", {})
-            _model_info[name] = {
-                "param_size":   details.get("parameter_size", ""),
-                "quantization": details.get("quantization_level", ""),
-                "size_gb":      m.get("size", 0) / (1024 ** 3),
-                "family":       details.get("family", ""),
-            }
+        _model_info.update(list_models())
 
         model_names = list(_model_info.keys())
         print(f"[Models] {len(model_names)} available:")
         for n in model_names:
             i = _model_info[n]
-            print(f"  {n:<40}  {i['param_size']:<6}  {_fmt_size(i['size_gb']):<10}  {i['quantization']}")
+            print(f"  {n:<40}  {i['param_size']:<6}  {fmt_size(i['size_gb']):<10}  {i['quantization']}")
 
         if model_names:
             vision_model_dropdown["values"] = model_names
@@ -774,47 +283,16 @@ def warmup_model():
     fetch_models()
     try:
         for m in {vision_model_var.get(), text_model_var.get()}:
-            requests.post(OLLAMA_URL, json={
-                "model": m, "prompt": "ready", "stream": False, "keep_alive": -1
-            }, timeout=60)
+            warmup(m)
         update_queue_status()
     except Exception as e:
         status_var.set(f"⚠️ Warmup failed: {e}")
-
-def analyze_image_bytes(image_bytes, prompt, model):
-    """Run a vision model with an image attached."""
-    image_b64 = base64.b64encode(image_bytes).decode()
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "images": [image_b64],
-        "stream": False,
-        "keep_alive": -1
-    }
-    response = requests.post(OLLAMA_URL, json=payload, timeout=120)
-    response.raise_for_status()
-    return response.json().get("response", "No response received.")
-
-def analyze_text(prompt, model):
-    """Run a text-only model (no image)."""
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "keep_alive": -1
-    }
-    response = requests.post(OLLAMA_URL, json=payload, timeout=120)
-    response.raise_for_status()
-    return response.json().get("response", "No response received.")
 
 def build_ha_context():
     """Format current HA state into a readable string for the text model."""
     lines = []
     # Synthetic sensors first
-    child  = _synth["child"]
-    jacob  = _synth["jacob"]
-    lauren = _synth["lauren"]
-    emerg  = child and not (jacob or lauren)
+    child, jacob, lauren, emerg = synth.get_state()
     lines.append(
         f"SYNTHETIC SENSORS: "
         f"child_detected={'on' if child else 'off'}, "
@@ -972,7 +450,7 @@ def queue_worker():
                 _set_stage("vision", ts_str)
                 t0 = time.time()
                 vision_result = analyze_image_bytes(image_bytes, vision_prompt, vision_model)
-                check_synthetic_sensors(vision_result)
+                synth.check(vision_result)
 
                 _set_stage("judgment", ts_str)
                 chicago_now = datetime.now(CHICAGO_TZ).strftime("%A %B %d %Y  %I:%M:%S %p %Z")
@@ -1002,7 +480,9 @@ def queue_worker():
                 continue
 
             _set_stage("diff", ts_str)
-            cropped_bytes, debug_imgs, bbox = compute_motion_crop(frame_a, frame_b)
+            cropped_bytes, debug_imgs, bbox = compute_motion_crop(
+                frame_a, frame_b, min_box_pct_var.get(), crop_padding_var.get()
+            )
 
             if debug_imgs:
                 root.after(0, lambda d=debug_imgs: show_debug_window(d))
@@ -1014,14 +494,14 @@ def queue_worker():
             crop_b64 = base64.b64encode(cropped_bytes).decode()
             root.after(0, lambda b=crop_b64: show_detected_image(b))
 
-            distance = compute_distance(bbox)
+            distance = compute_distance(bbox, cam_state.far_zone)
             if distance:
                 root.after(0, lambda d=distance: _update_distance_display(d))
 
             _set_stage("vision", ts_str)
             t0 = time.time()
             vision_result = analyze_image_bytes(cropped_bytes, vision_prompt, vision_model)
-            check_synthetic_sensors(vision_result)
+            synth.check(vision_result)
 
             _set_stage("judgment", ts_str)
             chicago_now = datetime.now(CHICAGO_TZ).strftime("%A %B %d %Y  %I:%M:%S %p %Z")
@@ -1107,10 +587,10 @@ def enqueue_event(ts_float, ts_str, source="webhook", image_b64=None):
         ts_b = ts_float - snap_after_var.get()
         frame_a = get_frame_at(ts_a)
         frame_b = get_frame_at(ts_b)
-        if frame_a and mask_rects:
-            frame_a = jpeg_apply_mask(frame_a)
-        if frame_b and mask_rects:
-            frame_b = jpeg_apply_mask(frame_b)
+        if frame_a and cam_state.mask_rects:
+            frame_a = jpeg_apply_mask(frame_a, cam_state.mask_rects)
+        if frame_b and cam_state.mask_rects:
+            frame_b = jpeg_apply_mask(frame_b, cam_state.mask_rects)
 
     item = {
         "trigger_ts":    ts_float,
@@ -1279,204 +759,11 @@ def run_flask():
     flask_app.run(host="0.0.0.0", port=WEBHOOK_PORT, debug=False, use_reloader=False)
 
 # ---------------------------------------------------------------
-# AREA RESTRICTOR WIZARD
+# AREA RESTRICTOR WIZARD (implementation in mask_wizard.py)
 # ---------------------------------------------------------------
 def open_mask_wizard():
-    global mask_rects, far_zone
-
-    # Grab the most recent frame from the buffer
-    with buffer_lock:
-        snap = frame_buffer[-1][1] if frame_buffer else None
-    if snap is None:
-        status_var.set("⚠️ No frame in buffer yet — wait for stream to connect")
-        return
-
-    arr = np.frombuffer(snap, dtype=np.uint8)
-    native = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if native is None:
-        return
-    native_h, native_w = native.shape[:2]
-
-    disp_w, disp_h = 960, 540
-    scale_x = native_w / disp_w
-    scale_y = native_h / disp_h
-
-    win = tk.Toplevel(root)
-    win.title("Zone Editor — MASK (black exclusion) | FAR ZONE (15+ ft distance reference)")
-    win.configure(bg="#0a0a0a")
-    win.resizable(False, False)
-
-    rgb = cv2.cvtColor(native, cv2.COLOR_BGR2RGB)
-    pil_bg = Image.fromarray(rgb).resize((disp_w, disp_h), Image.LANCZOS)
-
-    canvas = tk.Canvas(win, width=disp_w, height=disp_h,
-                       bg="#111111", cursor="crosshair", highlightthickness=0)
-    canvas.pack(padx=10, pady=(10, 4))
-
-    info_var = tk.StringVar()
-    tk.Label(win, textvariable=info_var, bg="#0a0a0a", fg="#555555",
-             font=("Courier New", 8)).pack()
-
-    btn_row = tk.Frame(win, bg="#0a0a0a")
-    btn_row.pack(fill=tk.X, padx=10, pady=(4, 10))
-
-    # Current drawing mode: "mask" or "far"
-    _mode = {"v": "mask"}
-
-    def _info_text():
-        fz = "SET" if far_zone else "not set"
-        return (f"{len(mask_rects)} mask zone(s)   |   far zone: {fz}"
-                f"   |   mode: {'MASK ZONE' if _mode['v'] == 'mask' else '15+ FT ZONE'}"
-                f"   |   right-click to delete")
-
-    def redraw():
-        canvas.delete("all")
-        tk_img = ImageTk.PhotoImage(pil_bg)
-        canvas.create_image(0, 0, anchor="nw", image=tk_img)
-        canvas._bg_ref = tk_img
-
-        # Mask zones — black fill, red outline
-        for i, (x1, y1, x2, y2) in enumerate(mask_rects):
-            dx1, dy1 = int(x1 / scale_x), int(y1 / scale_y)
-            dx2, dy2 = int(x2 / scale_x), int(y2 / scale_y)
-            canvas.create_rectangle(dx1, dy1, dx2, dy2,
-                                    fill="black", outline="#ff4444", width=2)
-            canvas.create_text(dx1 + 4, dy1 + 4, anchor="nw",
-                               text=str(i + 1), fill="#ff4444",
-                               font=("Courier New", 9, "bold"))
-
-        # Far zone — no fill, blue outline with label
-        if far_zone:
-            fx1, fy1, fx2, fy2 = far_zone
-            dx1, dy1 = int(fx1 / scale_x), int(fy1 / scale_y)
-            dx2, dy2 = int(fx2 / scale_x), int(fy2 / scale_y)
-            canvas.create_rectangle(dx1, dy1, dx2, dy2,
-                                    fill="", outline="#4488ff", width=3,
-                                    dash=(8, 4))
-            canvas.create_text(dx1 + 6, dy1 + 6, anchor="nw",
-                               text="15+ ft zone", fill="#4488ff",
-                               font=("Courier New", 9, "bold"))
-
-        info_var.set(_info_text())
-
-    _draw = {"start": None, "live_rect": None}
-
-    def on_press(e):
-        _draw["start"] = (e.x, e.y)
-        if _draw["live_rect"]:
-            canvas.delete(_draw["live_rect"])
-            _draw["live_rect"] = None
-
-    def on_drag(e):
-        if _draw["start"] is None:
-            return
-        x0, y0 = _draw["start"]
-        if _draw["live_rect"]:
-            canvas.delete(_draw["live_rect"])
-        if _mode["v"] == "mask":
-            _draw["live_rect"] = canvas.create_rectangle(
-                x0, y0, e.x, e.y,
-                fill="black", outline="#ffaa00", width=2, stipple="gray50")
-        else:
-            _draw["live_rect"] = canvas.create_rectangle(
-                x0, y0, e.x, e.y,
-                fill="", outline="#4488ff", width=3, dash=(8, 4))
-
-    def on_release(e):
-        if _draw["start"] is None:
-            return
-        x0, y0 = _draw["start"]
-        x1_d, y1_d = min(x0, e.x), min(y0, e.y)
-        x2_d, y2_d = max(x0, e.x), max(y0, e.y)
-        _draw["start"] = None
-        if _draw["live_rect"]:
-            canvas.delete(_draw["live_rect"])
-            _draw["live_rect"] = None
-        if abs(x2_d - x1_d) < 5 or abs(y2_d - y1_d) < 5:
-            return
-        nx1 = max(0, int(x1_d * scale_x))
-        ny1 = max(0, int(y1_d * scale_y))
-        nx2 = min(native_w, int(x2_d * scale_x))
-        ny2 = min(native_h, int(y2_d * scale_y))
-        if _mode["v"] == "mask":
-            mask_rects.append((nx1, ny1, nx2, ny2))
-        else:
-            globals()["far_zone"] = (nx1, ny1, nx2, ny2)
-        redraw()
-        schedule_save()
-
-    def on_right_click(e):
-        # Check far zone first
-        if far_zone:
-            fx1, fy1, fx2, fy2 = far_zone
-            dx1, dy1 = int(fx1 / scale_x), int(fy1 / scale_y)
-            dx2, dy2 = int(fx2 / scale_x), int(fy2 / scale_y)
-            if dx1 <= e.x <= dx2 and dy1 <= e.y <= dy2:
-                globals()["far_zone"] = None
-                redraw()
-                schedule_save()
-                return
-        # Check mask zones
-        for i, (x1, y1, x2, y2) in enumerate(mask_rects):
-            dx1, dy1 = int(x1 / scale_x), int(y1 / scale_y)
-            dx2, dy2 = int(x2 / scale_x), int(y2 / scale_y)
-            if dx1 <= e.x <= dx2 and dy1 <= e.y <= dy2:
-                mask_rects.pop(i)
-                redraw()
-                schedule_save()
-                return
-
-    def clear_masks():
-        mask_rects.clear()
-        redraw()
-        schedule_save()
-
-    def clear_far():
-        globals()["far_zone"] = None
-        redraw()
-        schedule_save()
-
-    def toggle_mode():
-        _mode["v"] = "far" if _mode["v"] == "mask" else "mask"
-        if _mode["v"] == "mask":
-            mode_btn.config(text="MODE: MASK ZONE", fg="#ff4444",
-                            activeforeground="#ff4444", activebackground="#2a0000")
-        else:
-            mode_btn.config(text="MODE: 15+ FT ZONE", fg="#4488ff",
-                            activeforeground="#4488ff", activebackground="#00112a")
-        info_var.set(_info_text())
-
-    canvas.bind("<ButtonPress-1>",   on_press)
-    canvas.bind("<B1-Motion>",       on_drag)
-    canvas.bind("<ButtonRelease-1>", on_release)
-    canvas.bind("<Button-3>",        on_right_click)
-
-    mode_btn = tk.Button(btn_row, text="MODE: MASK ZONE", command=toggle_mode,
-              bg="#111111", fg="#ff4444", font=("Courier New", 9, "bold"),
-              relief=tk.FLAT, padx=10, pady=6, cursor="hand2",
-              activebackground="#2a0000", activeforeground="#ff4444", bd=0)
-    mode_btn.pack(side=tk.LEFT)
-
-    tk.Button(btn_row, text="🗑  CLEAR MASKS", command=clear_masks,
-              bg="#111111", fg="#ff4444", font=("Courier New", 9, "bold"),
-              relief=tk.FLAT, padx=10, pady=6, cursor="hand2",
-              activebackground="#2a0000", activeforeground="#ff4444", bd=0
-              ).pack(side=tk.LEFT, padx=(6, 0))
-
-    tk.Button(btn_row, text="✕  CLEAR FAR ZONE", command=clear_far,
-              bg="#111111", fg="#4488ff", font=("Courier New", 9, "bold"),
-              relief=tk.FLAT, padx=10, pady=6, cursor="hand2",
-              activebackground="#00112a", activeforeground="#4488ff", bd=0
-              ).pack(side=tk.LEFT, padx=(6, 0))
-
-    tk.Button(btn_row, text="✓  DONE", command=win.destroy,
-              bg="#111111", fg="#00ff88", font=("Courier New", 9, "bold"),
-              relief=tk.FLAT, padx=10, pady=6, cursor="hand2",
-              activebackground="#003322", activeforeground="#00ff88", bd=0
-              ).pack(side=tk.RIGHT)
-
-    redraw()
-    win.grab_set()
+    _open_mask_wizard(root, cam_state, frame_buffer, buffer_lock,
+                      status_var, schedule_save)
 
 # ---------------------------------------------------------------
 # MANUAL BROWSE
@@ -1520,8 +807,8 @@ def save_config(*_):
             "cam_name":        cam_name_var.get(),
             "cam_id":          cam_id_var.get(),
             "system_active":   system_active_var.get(),
-            "mask_rects":      [list(r) for r in mask_rects],
-            "far_zone":        list(far_zone) if far_zone else None,
+            "mask_rects":      [list(r) for r in cam_state.mask_rects],
+            "far_zone":        list(cam_state.far_zone) if cam_state.far_zone else None,
         }
         CONFIG_PATH.write_text(json.dumps(data, indent=2))
     except Exception as e:
@@ -1567,10 +854,10 @@ def load_config():
         if "system_active" in data:
             system_active_var.set(data["system_active"])
         if "mask_rects" in data:
-            mask_rects.clear()
-            mask_rects.extend(tuple(r) for r in data["mask_rects"])
+            cam_state.mask_rects.clear()
+            cam_state.mask_rects.extend(tuple(r) for r in data["mask_rects"])
         if "far_zone" in data and data["far_zone"]:
-            globals()["far_zone"] = tuple(data["far_zone"])
+            cam_state.far_zone = tuple(data["far_zone"])
         print(f"[Config] Loaded from {CONFIG_PATH}")
     except Exception as e:
         print(f"[Config] Load error: {e}")
@@ -1589,6 +876,9 @@ root.option_add("*TCombobox*Listbox.background",       "#ffffff")
 root.option_add("*TCombobox*Listbox.foreground",       "#000000")
 root.option_add("*TCombobox*Listbox.selectBackground", "#cceecc")
 root.option_add("*TCombobox*Listbox.selectForeground", "#000000")
+
+# Synthetic sensor manager (UI label refs wired in after HA panel is built)
+synth = SyntheticSensors(root, ha_state)
 
 # --- All tunable vars ---
 snap_before_var   = tk.DoubleVar(value=SNAP_BEFORE_SECS)
@@ -1944,20 +1234,26 @@ for group_name, entities in HA_GROUPS:
 
     # Inject synthetic sensors under OCCUPANCY
     if group_name == "OCCUPANCY":
-        synth_child_dot,  synth_child_val  = _ha_sensor_row("child detected", "clear")
-        synth_jacob_dot,  synth_jacob_val  = _ha_sensor_row("jacob detected", "clear")
-        synth_lauren_dot, synth_lauren_val = _ha_sensor_row("lauren detected","clear")
+        _sc_dot, _sc_val = _ha_sensor_row("child detected", "clear")
+        _sj_dot, _sj_val = _ha_sensor_row("jacob detected", "clear")
+        _sl_dot, _sl_val = _ha_sensor_row("lauren detected","clear")
         # Emergency row
         emerg_row = tk.Frame(ha_list, bg="#0d0d0d")
         emerg_row.pack(fill=tk.X, padx=12, pady=1)
-        synth_emerg_dot = tk.Label(emerg_row, text="○", bg="#0d0d0d", fg="#333333",
-                                   font=("Courier New", 10, "bold"), width=2)
-        synth_emerg_dot.pack(side=tk.LEFT)
+        _se_dot = tk.Label(emerg_row, text="○", bg="#0d0d0d", fg="#333333",
+                           font=("Courier New", 10, "bold"), width=2)
+        _se_dot.pack(side=tk.LEFT)
         tk.Label(emerg_row, text="⚠ child alone", bg="#0d0d0d", fg="#884400",
                  font=("Courier New", 8, "bold"), width=16, anchor="w").pack(side=tk.LEFT)
-        synth_emerg_val = tk.Label(emerg_row, text="clear", bg="#0d0d0d", fg="#444444",
-                                   font=("Courier New", 8), anchor="w")
-        synth_emerg_val.pack(side=tk.LEFT)
+        _se_val = tk.Label(emerg_row, text="clear", bg="#0d0d0d", fg="#444444",
+                           font=("Courier New", 8), anchor="w")
+        _se_val.pack(side=tk.LEFT)
+        synth.set_ui_refs(
+            child_dot=_sc_dot,  child_val=_sc_val,
+            jacob_dot=_sj_dot,  jacob_val=_sj_val,
+            lauren_dot=_sl_dot, lauren_val=_sl_val,
+            emerg_dot=_se_dot,  emerg_val=_se_val,
+        )
 
 # CAMERA group — distance sensor (populated by detection events)
 tk.Label(ha_list, text="CAMERA", bg="#0d0d0d", fg="#333333",
