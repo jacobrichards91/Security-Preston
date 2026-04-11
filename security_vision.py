@@ -1245,24 +1245,30 @@ def event():
 
         ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"\n[Webhook] {ts_str} — incoming POST to /event")
-        print(f"[Webhook] payload: {raw[:500]}")  # first 500 chars to avoid flood
+        print(f"[Webhook] payload: {raw[:500]}")
 
         alarm = data.get("alarm", {})
         triggers = alarm.get("triggers", [])
         trigger_key = triggers[0].get("key", "unknown") if triggers else "unknown"
         print(f"[Webhook] trigger_key={trigger_key!r}")
 
-        if trigger_key != "line_crossed":
-            print(f"[Webhook] SKIPPED — expected 'line_crossed', got {trigger_key!r}")
-            root.after(0, lambda k=trigger_key: status_var.set(
-                f"⚠️ Webhook received but skipped (trigger={k!r}) — check console"
+        # Route by camera ID — search raw payload for each tab's configured ID
+        raw_upper = raw.upper()
+        configured_id = cam_id_var.get().strip().upper()
+        cam_name = cam_name_var.get() or "Camera"
+
+        if configured_id and configured_id in raw_upper:
+            print(f"[Webhook] MATCHED camera '{cam_name}' (ID={configured_id}) — queuing analysis")
+            ts_float = time.time()
+            enqueue_event(ts_float, ts_str, source="webhook")
+            return "OK", 200
+        else:
+            print(f"[Webhook] SKIPPED — no matching camera ID found in payload "
+                  f"(configured={configured_id!r})")
+            root.after(0, lambda: status_var.set(
+                f"Webhook received — no camera ID match (configured={configured_id!r})"
             ))
             return "SKIP", 200
-
-        print(f"[Webhook] ACCEPTED — queuing analysis")
-        ts_float = time.time()
-        enqueue_event(ts_float, ts_str, source="webhook")
-        return "OK", 200
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -1512,6 +1518,7 @@ def save_config(*_):
             "crop_padding":    crop_padding_var.get(),
             "min_box_pct":     min_box_pct_var.get(),
             "cam_name":        cam_name_var.get(),
+            "cam_id":          cam_id_var.get(),
             "system_active":   system_active_var.get(),
             "mask_rects":      [list(r) for r in mask_rects],
             "far_zone":        list(far_zone) if far_zone else None,
@@ -1555,6 +1562,8 @@ def load_config():
             min_box_pct_var.set(data["min_box_pct"])
         if "cam_name" in data:
             cam_name_var.set(data["cam_name"])
+        if "cam_id" in data:
+            cam_id_var.set(data["cam_id"])
         if "system_active" in data:
             system_active_var.set(data["system_active"])
         if "mask_rects" in data:
@@ -1590,10 +1599,12 @@ min_box_pct_var   = tk.DoubleVar(value=MIN_BOX_PCT)
 vision_model_var  = tk.StringVar(value=DEFAULT_VISION_MODEL)
 text_model_var    = tk.StringVar(value=DEFAULT_TEXT_MODEL)
 cam_name_var      = tk.StringVar(value="Front Door")
+cam_id_var        = tk.StringVar(value="A89C6C004BF5")
 system_active_var = tk.BooleanVar(value=True)
 
 for _v in (snap_before_var, snap_after_var, buffer_secs_var,
-           crop_padding_var, min_box_pct_var, vision_model_var, text_model_var):
+           crop_padding_var, min_box_pct_var, vision_model_var, text_model_var,
+           cam_name_var, cam_id_var):
     _v.trace_add("write", schedule_save)
 
 # --- Status bar and debug (outside tabs, always visible) ---
@@ -1617,10 +1628,10 @@ style.map("Dark.TNotebook.Tab",
     background=[("selected", "#0a0a0a")],
     foreground=[("selected", "#00ff88")])
 style.configure("Dark.TCombobox",
-    fieldbackground="#111111", background="#111111",
-    foreground="#00ff88", arrowcolor="#00ff88",
-    selectbackground="#003322", selectforeground="#00ff88",
-    bordercolor="#222222", lightcolor="#111111", darkcolor="#111111")
+    fieldbackground="#f5f5f5", background="#f5f5f5",
+    foreground="#000000", arrowcolor="#333333",
+    selectbackground="#0078d7", selectforeground="#ffffff",
+    bordercolor="#cccccc", lightcolor="#f5f5f5", darkcolor="#f5f5f5")
 
 notebook = ttk.Notebook(root, style="Dark.TNotebook")
 notebook.pack(fill=tk.BOTH, expand=True)
@@ -1729,6 +1740,12 @@ _timing_spin(timing_frame, "before",   snap_before_var,  0.1, 29.0, 0.1)
 _timing_spin(timing_frame, "after",    snap_after_var,   0.0, 29.0, 0.1)
 _timing_spin(timing_frame, "padding",  crop_padding_var, 0,   500,  10,  unit="px")
 _timing_spin(timing_frame, "min box",  min_box_pct_var,  0.0, 10.0, 0.01, unit="%")
+tk.Label(timing_frame, text="cam ID", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8)).pack(side=tk.LEFT, padx=(12, 2))
+tk.Entry(timing_frame, textvariable=cam_id_var, width=14,
+         bg="#111111", fg="#00ff88", insertbackground="#00ff88",
+         font=("Courier New", 9), relief=tk.FLAT, bd=2
+         ).pack(side=tk.LEFT, padx=(0, 4))
 
 # ═══════════════════════════════════════════════
 # TAB 2 — MASTER  (queue badge | left controls | right HA panel)
