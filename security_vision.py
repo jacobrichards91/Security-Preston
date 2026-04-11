@@ -1224,8 +1224,8 @@ ha_canvas.bind("<Configure>", _ha_canvas_resize)
 # Build entity rows grouped
 for group_name, entities in HA_GROUPS:
     tk.Label(ha_list, text=group_name, bg="#0d0d0d", fg="#333333",
-             font=("Courier New", 7, "bold"), padx=12, pady=(8, 2),
-             anchor="w").pack(fill=tk.X)
+             font=("Courier New", 7, "bold"), padx=12,
+             anchor="w").pack(fill=tk.X, pady=(8, 2))
     for eid in entities:
         row = tk.Frame(ha_list, bg="#0d0d0d")
         row.pack(fill=tk.X, padx=12, pady=1)
