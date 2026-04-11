@@ -48,7 +48,10 @@ analysis_queue = queue.Queue()
 
 # --- Rolling frame buffer: deque of (timestamp, image_bytes) ---
 frame_buffer = collections.deque()
-buffer_lock = threading.Lock()
+buffer_lock  = threading.Lock()
+
+# --- Area exclusion mask: list of (x1, y1, x2, y2) in native frame pixels ---
+mask_rects = []
 
 # ---------------------------------------------------------------
 # FRAME BUFFER WORKER
@@ -122,6 +125,25 @@ def get_frame_at(target_ts):
             return None
         best = min(frame_buffer, key=lambda x: abs(x[0] - target_ts))
         return best[1]
+
+def apply_mask(img_bgr):
+    """Paint black over every rect in mask_rects. Operates in-place on a copy."""
+    if not mask_rects:
+        return img_bgr
+    out = img_bgr.copy()
+    for (x1, y1, x2, y2) in mask_rects:
+        out[y1:y2, x1:x2] = 0
+    return out
+
+def jpeg_apply_mask(jpeg_bytes):
+    """Decode JPEG bytes → apply mask → re-encode. Returns bytes."""
+    arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        return jpeg_bytes
+    img = apply_mask(img)
+    _, enc = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    return enc.tobytes()
 
 # ---------------------------------------------------------------
 # MOTION DETECTION & BOUNDING BOX
@@ -385,6 +407,11 @@ def queue_worker():
                     f"⚠️ [{t}] Buffer miss — not enough frames yet"))
                 continue
 
+            # Apply exclusion mask before diff and AI
+            if mask_rects:
+                frame_a = jpeg_apply_mask(frame_a)
+                frame_b = jpeg_apply_mask(frame_b)
+
             root.after(0, lambda t=ts_str: status_var.set(f"🔬 Computing motion diff [{t}]"))
 
             # --- Motion diff + crop ---
@@ -515,6 +542,153 @@ def event():
 
 def run_flask():
     flask_app.run(host="0.0.0.0", port=WEBHOOK_PORT, debug=False, use_reloader=False)
+
+# ---------------------------------------------------------------
+# AREA RESTRICTOR WIZARD
+# ---------------------------------------------------------------
+def open_mask_wizard():
+    global mask_rects
+
+    # Grab the most recent frame from the buffer
+    with buffer_lock:
+        snap = frame_buffer[-1][1] if frame_buffer else None
+    if snap is None:
+        status_var.set("⚠️ No frame in buffer yet — wait for stream to connect")
+        return
+
+    arr = np.frombuffer(snap, dtype=np.uint8)
+    native = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if native is None:
+        return
+    native_h, native_w = native.shape[:2]
+
+    # Display size
+    disp_w, disp_h = 960, 540
+    scale_x = native_w / disp_w
+    scale_y = native_h / disp_h
+
+    win = tk.Toplevel(root)
+    win.title("Area Restrictor — draw boxes to exclude, right-click to delete")
+    win.configure(bg="#0a0a0a")
+    win.resizable(False, False)
+
+    # Convert frame to PIL for display
+    rgb = cv2.cvtColor(native, cv2.COLOR_BGR2RGB)
+    pil_bg = Image.fromarray(rgb).resize((disp_w, disp_h), Image.LANCZOS)
+
+    # We'll redraw the canvas whenever rects change
+    canvas = tk.Canvas(win, width=disp_w, height=disp_h,
+                       bg="#111111", cursor="crosshair",
+                       highlightthickness=0)
+    canvas.pack(padx=10, pady=(10, 4))
+
+    # Header info
+    info_var = tk.StringVar(value=f"{len(mask_rects)} zone(s) active — drag to add, right-click to delete")
+    tk.Label(win, textvariable=info_var, bg="#0a0a0a", fg="#555555",
+             font=("Courier New", 8)).pack()
+
+    # Button row
+    btn_row = tk.Frame(win, bg="#0a0a0a")
+    btn_row.pack(fill=tk.X, padx=10, pady=(4, 10))
+
+    def redraw():
+        canvas.delete("all")
+        # Draw background frame
+        tk_img = ImageTk.PhotoImage(pil_bg)
+        canvas.create_image(0, 0, anchor="nw", image=tk_img)
+        canvas._bg_ref = tk_img  # keep reference
+
+        # Draw saved rects
+        for i, (x1, y1, x2, y2) in enumerate(mask_rects):
+            dx1 = int(x1 / scale_x)
+            dy1 = int(y1 / scale_y)
+            dx2 = int(x2 / scale_x)
+            dy2 = int(y2 / scale_y)
+            canvas.create_rectangle(dx1, dy1, dx2, dy2,
+                                    fill="black", outline="#ff4444", width=2,
+                                    tags=f"rect{i}")
+            # Label in corner
+            canvas.create_text(dx1 + 4, dy1 + 4, anchor="nw",
+                                text=str(i + 1), fill="#ff4444",
+                                font=("Courier New", 9, "bold"))
+
+        info_var.set(f"{len(mask_rects)} zone(s) active — drag to add, right-click to delete")
+
+    # Drawing state
+    _draw = {"start": None, "live_rect": None}
+
+    def on_press(e):
+        _draw["start"] = (e.x, e.y)
+        if _draw["live_rect"]:
+            canvas.delete(_draw["live_rect"])
+            _draw["live_rect"] = None
+
+    def on_drag(e):
+        if _draw["start"] is None:
+            return
+        x0, y0 = _draw["start"]
+        if _draw["live_rect"]:
+            canvas.delete(_draw["live_rect"])
+        _draw["live_rect"] = canvas.create_rectangle(
+            x0, y0, e.x, e.y,
+            fill="black", outline="#ffaa00", width=2, stipple="gray50"
+        )
+
+    def on_release(e):
+        if _draw["start"] is None:
+            return
+        x0, y0 = _draw["start"]
+        x1_d, y1_d = min(x0, e.x), min(y0, e.y)
+        x2_d, y2_d = max(x0, e.x), max(y0, e.y)
+        _draw["start"] = None
+        if _draw["live_rect"]:
+            canvas.delete(_draw["live_rect"])
+            _draw["live_rect"] = None
+        if abs(x2_d - x1_d) < 5 or abs(y2_d - y1_d) < 5:
+            return  # too small, ignore
+        # Scale back to native resolution
+        nx1 = max(0, int(x1_d * scale_x))
+        ny1 = max(0, int(y1_d * scale_y))
+        nx2 = min(native_w, int(x2_d * scale_x))
+        ny2 = min(native_h, int(y2_d * scale_y))
+        mask_rects.append((nx1, ny1, nx2, ny2))
+        redraw()
+
+    def on_right_click(e):
+        # Find and delete the rect clicked on
+        for i, (x1, y1, x2, y2) in enumerate(mask_rects):
+            dx1 = int(x1 / scale_x)
+            dy1 = int(y1 / scale_y)
+            dx2 = int(x2 / scale_x)
+            dy2 = int(y2 / scale_y)
+            if dx1 <= e.x <= dx2 and dy1 <= e.y <= dy2:
+                mask_rects.pop(i)
+                redraw()
+                return
+
+    def clear_all():
+        mask_rects.clear()
+        redraw()
+
+    canvas.bind("<ButtonPress-1>",   on_press)
+    canvas.bind("<B1-Motion>",       on_drag)
+    canvas.bind("<ButtonRelease-1>", on_release)
+    canvas.bind("<Button-3>",        on_right_click)
+
+    tk.Button(btn_row, text="🗑  CLEAR ALL", command=clear_all,
+              bg="#111111", fg="#ff4444", font=("Courier New", 9, "bold"),
+              relief=tk.FLAT, padx=10, pady=6, cursor="hand2",
+              activebackground="#2a0000", activeforeground="#ff4444", bd=0
+              ).pack(side=tk.LEFT)
+
+    tk.Button(btn_row, text="✓  DONE", command=win.destroy,
+              bg="#111111", fg="#00ff88", font=("Courier New", 9, "bold"),
+              relief=tk.FLAT, padx=10, pady=6, cursor="hand2",
+              activebackground="#003322", activeforeground="#00ff88", bd=0
+              ).pack(side=tk.RIGHT)
+
+    redraw()
+    win.grab_set()
 
 # ---------------------------------------------------------------
 # MANUAL BROWSE
@@ -654,6 +828,14 @@ snap_btn = tk.Button(
     activebackground="#001a33", activeforeground="#00aaff", bd=0
 )
 snap_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+
+mask_btn = tk.Button(
+    action_row, text="⬛  MASK ZONES", command=open_mask_wizard,
+    bg="#111111", fg="#ff8800", font=("Courier New", 10, "bold"),
+    relief=tk.FLAT, padx=12, pady=10, cursor="hand2",
+    activebackground="#2a1800", activeforeground="#ff8800", bd=0
+)
+mask_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
 
 timer_var = tk.StringVar(value="⏱  —")
 tk.Label(action_row, textvariable=timer_var, bg="#0a0a0a", fg="#00aaff",
