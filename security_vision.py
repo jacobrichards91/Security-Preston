@@ -64,6 +64,8 @@ def grab_raw_frame():
         cmd = [
             "ffmpeg", "-y",
             "-rtsp_transport", "tcp",
+            "-stimeout", "5000000",      # 5s socket timeout (microseconds)
+            "-timeout", "5000000",        # 5s connection timeout (microseconds)
             "-allowed_extensions", "all",
             "-i", RTSP_URL,
             "-frames:v", "1",
@@ -71,23 +73,28 @@ def grab_raw_frame():
             "-f", "image2",
             tmp_path
         ]
+        stderr_pipe = None if DEBUG_MODE else subprocess.DEVNULL
         result = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, timeout=10)
+                                stderr=stderr_pipe, timeout=15)
         if result.returncode == 0 and Path(tmp_path).exists():
             data = Path(tmp_path).read_bytes()
             Path(tmp_path).unlink(missing_ok=True)
             return data
         Path(tmp_path).unlink(missing_ok=True)
         return None
-    except Exception:
+    except Exception as e:
+        if DEBUG_MODE:
+            print(f"[RTSP] grab_raw_frame error: {e}")
         return None
 
 def buffer_worker():
     """Continuously grab frames and maintain rolling buffer."""
+    _fail_count = 0
     while True:
         t0 = time.time()
         data = grab_raw_frame()
         if data:
+            _fail_count = 0
             ts = time.time()
             with buffer_lock:
                 frame_buffer.append((ts, data))
@@ -98,6 +105,13 @@ def buffer_worker():
             # Update live preview in UI
             b64 = base64.b64encode(data).decode()
             root.after(0, lambda b=b64: update_stream_preview(b))
+        else:
+            _fail_count += 1
+            if DEBUG_MODE:
+                print(f"[RTSP] Frame grab failed (attempt {_fail_count}) — {RTSP_URL}")
+            root.after(0, lambda n=_fail_count: stream_status_var.set(
+                f"🔴 Disconnected — retrying... (attempt {n})"
+            ))
         elapsed = time.time() - t0
         sleep = max(0, FRAME_INTERVAL - elapsed)
         time.sleep(sleep)
