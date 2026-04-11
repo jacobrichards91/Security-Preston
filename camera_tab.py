@@ -1,115 +1,25 @@
 """
-camera_tab.py — Per-camera tab widget, RTSP buffer worker, and motion helpers.
-Imported by security_vision.py.
+camera_tab.py — Per-camera tab widget: RTSP stream, frame buffer, mask/far zones,
+per-camera tuning, and the full camera tab UI. Imported by security_vision.py.
 """
 
 import tkinter as tk
 from tkinter import filedialog
 import threading
 import collections
-import numpy as np
-import cv2
-from PIL import Image, ImageTk
 import base64
 import io
 import time
 from datetime import datetime
+import cv2
+from PIL import Image, ImageTk
 
-FRAME_INTERVAL = 0.2   # seconds between buffer grabs
-
-# ── Pure image helpers ────────────────────────────────────────────────────────
-
-def apply_mask(img_bgr, mask_rects):
-    """Paint black over every rect in mask_rects (in-place on a copy)."""
-    if not mask_rects:
-        return img_bgr
-    out = img_bgr.copy()
-    for (x1, y1, x2, y2) in mask_rects:
-        out[y1:y2, x1:x2] = 0
-    return out
-
-
-def jpeg_apply_mask(jpeg_bytes, mask_rects):
-    """Decode JPEG → apply mask → re-encode. Returns bytes."""
-    arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        return jpeg_bytes
-    img = apply_mask(img, mask_rects)
-    _, enc = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 92])
-    return enc.tobytes()
-
-
-def compute_motion_crop(frame_a_bytes, frame_b_bytes, min_box_pct, crop_padding):
-    """
-    Diff two JPEG frames.
-    Returns (cropped_bytes, debug_images_dict, bbox) where bbox is (x1,y1,x2,y2) or None.
-    """
-    arr_a = np.frombuffer(frame_a_bytes, dtype=np.uint8)
-    arr_b = np.frombuffer(frame_b_bytes, dtype=np.uint8)
-    img_a = cv2.imdecode(arr_a, cv2.IMREAD_COLOR)
-    img_b = cv2.imdecode(arr_b, cv2.IMREAD_COLOR)
-
-    if img_a is None or img_b is None:
-        return None, {}, None
-
-    if img_a.shape != img_b.shape:
-        img_b = cv2.resize(img_b, (img_a.shape[1], img_a.shape[0]))
-
-    h, w = img_a.shape[:2]
-    gray_a = cv2.cvtColor(img_a, cv2.COLOR_BGR2GRAY)
-    gray_b = cv2.cvtColor(img_b, cv2.COLOR_BGR2GRAY)
-    blur_a = cv2.GaussianBlur(gray_a, (21, 21), 0)
-    blur_b = cv2.GaussianBlur(gray_b, (21, 21), 0)
-    diff   = cv2.absdiff(blur_a, blur_b)
-    _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    dilated = cv2.dilate(thresh, kernel, iterations=2)
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    min_area = w * h * (min_box_pct / 100.0)
-    contours = [c for c in contours if cv2.contourArea(c) > min_area]
-
-    bbox = None
-    cropped_bytes = None
-
-    if contours:
-        x1 = min(cv2.boundingRect(c)[0] for c in contours)
-        y1 = min(cv2.boundingRect(c)[1] for c in contours)
-        x2 = max(cv2.boundingRect(c)[0] + cv2.boundingRect(c)[2] for c in contours)
-        y2 = max(cv2.boundingRect(c)[1] + cv2.boundingRect(c)[3] for c in contours)
-        pad  = int(crop_padding)
-        x1p  = max(0, x1 - pad)
-        y1p  = max(0, y1 - pad)
-        x2p  = min(w, x2 + pad)
-        y2p  = min(h, y2 + pad)
-        bbox = (x1p, y1p, x2p, y2p)
-        crop = img_b[y1p:y2p, x1p:x2p]
-        _, crop_enc = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
-        cropped_bytes = crop_enc.tobytes()
-
-    def _cv2pil(img, gray=False):
-        if gray:
-            return Image.fromarray(img)
-        return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-
-    debug = {
-        "Frame A\n(before)":  _cv2pil(img_a),
-        "Frame B\n(after)":   _cv2pil(img_b),
-        "Diff":               _cv2pil(diff,    gray=True),
-        "Threshold":          _cv2pil(thresh,  gray=True),
-        "Dilated\nmask":      _cv2pil(dilated, gray=True),
-    }
-    img_b_annot = img_b.copy()
-    if bbox:
-        x1p, y1p, x2p, y2p = bbox
-        cv2.rectangle(img_b_annot, (x1p, y1p), (x2p, y2p), (0, 255, 0), 3)
-        cv2.drawContours(img_b_annot, contours, -1, (0, 0, 255), 2)
-    debug["Bounding\nbox"] = _cv2pil(img_b_annot)
-    if cropped_bytes:
-        debug["AI\nCrop"] = Image.open(io.BytesIO(cropped_bytes))
-
-    return cropped_bytes, debug, bbox
+from constants import (
+    FRAME_INTERVAL, BUFFER_SECONDS, SNAP_BEFORE_SECS, SNAP_AFTER_SECS,
+    CROP_PADDING, MIN_BOX_PCT,
+)
+from motion import jpeg_apply_mask
+from mask_wizard import open_mask_wizard as _open_mask_wizard
 
 
 # ── CameraTab ─────────────────────────────────────────────────────────────────
@@ -141,11 +51,11 @@ class CameraTab:
         self.rtsp_url_var     = tk.StringVar(root, value="")
         self.cam_name_var     = tk.StringVar(root, value=f"Camera {tab_index + 1}")
         self.cam_id_var       = tk.StringVar(root, value="")
-        self.snap_before_var  = tk.DoubleVar(root, value=2.5)
-        self.snap_after_var   = tk.DoubleVar(root, value=2.0)
-        self.buffer_secs_var  = tk.DoubleVar(root, value=3.0)
-        self.crop_padding_var = tk.IntVar(root,    value=50)
-        self.min_box_pct_var  = tk.DoubleVar(root, value=0.05)
+        self.snap_before_var  = tk.DoubleVar(root, value=SNAP_BEFORE_SECS)
+        self.snap_after_var   = tk.DoubleVar(root, value=SNAP_AFTER_SECS)
+        self.buffer_secs_var  = tk.DoubleVar(root, value=BUFFER_SECONDS)
+        self.crop_padding_var = tk.IntVar(root,    value=CROP_PADDING)
+        self.min_box_pct_var  = tk.DoubleVar(root, value=MIN_BOX_PCT)
 
         # ── Buffer state ──────────────────────────────────────────────────
         self.frame_buffer = collections.deque()
@@ -157,6 +67,11 @@ class CameraTab:
         self._stream_running = False
         self._stream_thread  = None
 
+        # Camera is only persisted to config after its stream has produced
+        # at least one frame — this prevents saving broken/typo RTSP URLs.
+        # Cameras loaded from config start verified=True.
+        self.verified = False
+
         # ── UI widget refs (set in build_ui) ──────────────────────────────
         self.tab_frame         = None
         self.stream_label      = None
@@ -167,12 +82,11 @@ class CameraTab:
         self._go_btn           = None
         self._rtsp_entry       = None
 
-        # Debounce-save on any setting change
-        ss = app_refs["schedule_save"]
+        # Debounce-save on any setting change (only after verification).
         for v in (self.rtsp_url_var, self.cam_name_var, self.cam_id_var,
                   self.snap_before_var, self.snap_after_var, self.buffer_secs_var,
                   self.crop_padding_var, self.min_box_pct_var):
-            v.trace_add("write", lambda *_, f=ss: f())
+            v.trace_add("write", lambda *_: self._maybe_save())
 
         # Update tab label when name changes
         self.cam_name_var.trace_add("write", self._on_cam_name)
@@ -185,6 +99,12 @@ class CameraTab:
             self.notebook.tab(self.tab_frame, text=self.cam_name_var.get() or "Camera")
         except Exception:
             pass
+
+    # ── Save gate ────────────────────────────────────────────────────────
+    def _maybe_save(self):
+        """Only debounce-save once this camera has been verified via a live frame."""
+        if self.verified:
+            self.app_refs["schedule_save"]()
 
     # ── UI build ──────────────────────────────────────────────────────────
     def build_ui(self):
@@ -399,9 +319,10 @@ class CameraTab:
             b64 = base64.b64encode(data).decode()
             root.after(0, lambda b=b64: self.update_stream_preview(b))
 
-            # Save config once on first successful frame (stream validated)
+            # Mark camera verified + save config on first successful frame.
             if not first_success:
                 first_success = True
+                self.verified = True
                 root.after(0, self.app_refs["schedule_save"])
                 print(f"[RTSP:{self.cam_name_var.get()}] Stream connected — config saved")
 
@@ -549,189 +470,15 @@ class CameraTab:
 
     # ── Mask / far-zone wizard ────────────────────────────────────────────
     def open_mask_wizard(self):
-        root = self.app_refs["root"]
-        with self.buffer_lock:
-            snap = self.frame_buffer[-1][1] if self.frame_buffer else None
-        if snap is None:
-            self.app_refs["status_var"].set(
-                "⚠  No frame in buffer — connect stream first")
-            return
-
-        arr    = np.frombuffer(snap, dtype=np.uint8)
-        native = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if native is None:
-            return
-
-        native_h, native_w = native.shape[:2]
-        disp_w, disp_h = 960, 540
-        scale_x = native_w / disp_w
-        scale_y = native_h / disp_h
-
-        win = tk.Toplevel(root)
-        win.title(f"Zone Editor — {self.cam_name_var.get()}")
-        win.configure(bg="#0a0a0a")
-        win.resizable(False, False)
-
-        rgb    = cv2.cvtColor(native, cv2.COLOR_BGR2RGB)
-        pil_bg = Image.fromarray(rgb).resize((disp_w, disp_h), Image.LANCZOS)
-        canvas = tk.Canvas(win, width=disp_w, height=disp_h,
-                           bg="#111111", cursor="crosshair", highlightthickness=0)
-        canvas.pack(padx=10, pady=(10, 4))
-        info_var = tk.StringVar()
-        tk.Label(win, textvariable=info_var, bg="#0a0a0a", fg="#555555",
-                 font=("Courier New", 8)).pack()
-        btn_row = tk.Frame(win, bg="#0a0a0a")
-        btn_row.pack(fill=tk.X, padx=10, pady=(4, 10))
-
-        _mode = {"v": "mask"}
-
-        def _info_text():
-            fz = "SET" if self.far_zone else "not set"
-            m  = "MASK ZONE" if _mode["v"] == "mask" else "15+ FT ZONE"
-            return (f"{len(self.mask_rects)} mask zone(s)   |   "
-                    f"far zone: {fz}   |   mode: {m}   |   right-click to delete")
-
-        def redraw():
-            canvas.delete("all")
-            tk_img = ImageTk.PhotoImage(pil_bg)
-            canvas.create_image(0, 0, anchor="nw", image=tk_img)
-            canvas._bg_ref = tk_img
-            for i, (x1, y1, x2, y2) in enumerate(self.mask_rects):
-                dx1 = int(x1 / scale_x); dy1 = int(y1 / scale_y)
-                dx2 = int(x2 / scale_x); dy2 = int(y2 / scale_y)
-                canvas.create_rectangle(dx1, dy1, dx2, dy2,
-                                        fill="black", outline="#ff4444", width=2)
-                canvas.create_text(dx1 + 4, dy1 + 4, anchor="nw",
-                                   text=str(i + 1), fill="#ff4444",
-                                   font=("Courier New", 9, "bold"))
-            if self.far_zone:
-                fx1, fy1, fx2, fy2 = self.far_zone
-                dx1 = int(fx1 / scale_x); dy1 = int(fy1 / scale_y)
-                dx2 = int(fx2 / scale_x); dy2 = int(fy2 / scale_y)
-                canvas.create_rectangle(dx1, dy1, dx2, dy2,
-                                        fill="", outline="#4488ff",
-                                        width=3, dash=(8, 4))
-                canvas.create_text(dx1 + 6, dy1 + 6, anchor="nw",
-                                   text="15+ ft zone", fill="#4488ff",
-                                   font=("Courier New", 9, "bold"))
-            info_var.set(_info_text())
-
-        _draw = {"start": None, "live_rect": None}
-
-        def on_press(e):
-            _draw["start"] = (e.x, e.y)
-            if _draw["live_rect"]:
-                canvas.delete(_draw["live_rect"])
-                _draw["live_rect"] = None
-
-        def on_drag(e):
-            if _draw["start"] is None:
-                return
-            x0, y0 = _draw["start"]
-            if _draw["live_rect"]:
-                canvas.delete(_draw["live_rect"])
-            if _mode["v"] == "mask":
-                _draw["live_rect"] = canvas.create_rectangle(
-                    x0, y0, e.x, e.y,
-                    fill="black", outline="#ffaa00", width=2, stipple="gray50")
-            else:
-                _draw["live_rect"] = canvas.create_rectangle(
-                    x0, y0, e.x, e.y,
-                    fill="", outline="#4488ff", width=3, dash=(8, 4))
-
-        def on_release(e):
-            if _draw["start"] is None:
-                return
-            x0, y0 = _draw["start"]
-            x1_d = min(x0, e.x); y1_d = min(y0, e.y)
-            x2_d = max(x0, e.x); y2_d = max(y0, e.y)
-            _draw["start"] = None
-            if _draw["live_rect"]:
-                canvas.delete(_draw["live_rect"])
-                _draw["live_rect"] = None
-            if abs(x2_d - x1_d) < 5 or abs(y2_d - y1_d) < 5:
-                return
-            nx1 = max(0, int(x1_d * scale_x));  ny1 = max(0, int(y1_d * scale_y))
-            nx2 = min(native_w, int(x2_d * scale_x))
-            ny2 = min(native_h, int(y2_d * scale_y))
-            if _mode["v"] == "mask":
-                self.mask_rects.append((nx1, ny1, nx2, ny2))
-            else:
-                self.far_zone = (nx1, ny1, nx2, ny2)
-            redraw()
-            self.app_refs["schedule_save"]()
-
-        def on_right_click(e):
-            if self.far_zone:
-                fx1, fy1, fx2, fy2 = self.far_zone
-                dx1 = int(fx1/scale_x); dy1 = int(fy1/scale_y)
-                dx2 = int(fx2/scale_x); dy2 = int(fy2/scale_y)
-                if dx1 <= e.x <= dx2 and dy1 <= e.y <= dy2:
-                    self.far_zone = None
-                    redraw()
-                    self.app_refs["schedule_save"]()
-                    return
-            for i, (x1, y1, x2, y2) in enumerate(self.mask_rects):
-                dx1 = int(x1/scale_x); dy1 = int(y1/scale_y)
-                dx2 = int(x2/scale_x); dy2 = int(y2/scale_y)
-                if dx1 <= e.x <= dx2 and dy1 <= e.y <= dy2:
-                    self.mask_rects.pop(i)
-                    redraw()
-                    self.app_refs["schedule_save"]()
-                    return
-
-        canvas.bind("<ButtonPress-1>",   on_press)
-        canvas.bind("<B1-Motion>",       on_drag)
-        canvas.bind("<ButtonRelease-1>", on_release)
-        canvas.bind("<Button-3>",        on_right_click)
-
-        _mode_btn = [None]
-
-        def toggle_mode():
-            _mode["v"] = "far" if _mode["v"] == "mask" else "mask"
-            mb = _mode_btn[0]
-            if mb:
-                if _mode["v"] == "mask":
-                    mb.config(text="MODE: MASK ZONE", fg="#ff4444",
-                              activeforeground="#ff4444", activebackground="#2a0000")
-                else:
-                    mb.config(text="MODE: 15+ FT ZONE", fg="#4488ff",
-                              activeforeground="#4488ff", activebackground="#00112a")
-            info_var.set(_info_text())
-
-        mb = tk.Button(btn_row, text="MODE: MASK ZONE", command=toggle_mode,
-                       bg="#111111", fg="#ff4444", font=("Courier New", 9, "bold"),
-                       relief=tk.FLAT, padx=10, pady=6, cursor="hand2",
-                       activebackground="#2a0000", activeforeground="#ff4444", bd=0)
-        mb.pack(side=tk.LEFT)
-        _mode_btn[0] = mb
-
-        tk.Button(btn_row, text="🗑  CLEAR MASKS",
-                  command=lambda: (self.mask_rects.clear(), redraw(),
-                                   self.app_refs["schedule_save"]()),
-                  bg="#111111", fg="#ff4444", font=("Courier New", 9, "bold"),
-                  relief=tk.FLAT, padx=10, pady=6, cursor="hand2",
-                  activebackground="#2a0000", activeforeground="#ff4444", bd=0
-                  ).pack(side=tk.LEFT, padx=(6, 0))
-
-        def _clear_far():
-            self.far_zone = None
-            redraw()
-            self.app_refs["schedule_save"]()
-
-        tk.Button(btn_row, text="✕  CLEAR FAR ZONE", command=_clear_far,
-                  bg="#111111", fg="#4488ff", font=("Courier New", 9, "bold"),
-                  relief=tk.FLAT, padx=10, pady=6, cursor="hand2",
-                  activebackground="#00112a", activeforeground="#4488ff", bd=0
-                  ).pack(side=tk.LEFT, padx=(6, 0))
-        tk.Button(btn_row, text="✓  DONE", command=win.destroy,
-                  bg="#111111", fg="#00ff88", font=("Courier New", 9, "bold"),
-                  relief=tk.FLAT, padx=10, pady=6, cursor="hand2",
-                  activebackground="#003322", activeforeground="#00ff88", bd=0
-                  ).pack(side=tk.RIGHT)
-
-        redraw()
-        win.grab_set()
+        _open_mask_wizard(
+            self.app_refs["root"],
+            self,                          # state: has mask_rects + far_zone
+            self.frame_buffer,
+            self.buffer_lock,
+            self.app_refs["status_var"],
+            self.app_refs["schedule_save"],
+            title=f"Zone Editor — {self.cam_name_var.get()}",
+        )
 
     # ── Serialization ─────────────────────────────────────────────────────
     def to_dict(self):

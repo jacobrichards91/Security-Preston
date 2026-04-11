@@ -12,7 +12,8 @@ import cv2
 from PIL import Image, ImageTk
 
 
-def open_mask_wizard(root, state, frame_buffer, buffer_lock, status_var, schedule_save):
+def open_mask_wizard(root, state, frame_buffer, buffer_lock, status_var,
+                     schedule_save, title=None):
     """
     Args:
       root           — Tk root window
@@ -21,6 +22,7 @@ def open_mask_wizard(root, state, frame_buffer, buffer_lock, status_var, schedul
       buffer_lock    — threading.Lock protecting frame_buffer
       status_var     — Tk StringVar for the status bar
       schedule_save  — function to debounce-save config
+      title          — optional Toplevel window title
     """
     # Grab the most recent frame from the buffer
     with buffer_lock:
@@ -40,7 +42,7 @@ def open_mask_wizard(root, state, frame_buffer, buffer_lock, status_var, schedul
     scale_y = native_h / disp_h
 
     win = tk.Toplevel(root)
-    win.title("Zone Editor — MASK (black exclusion) | FAR ZONE (15+ ft distance reference)")
+    win.title(title or "Zone Editor — MASK (black exclusion) | FAR ZONE (15+ ft distance reference)")
     win.configure(bg="#0a0a0a")
     win.resizable(False, False)
 
