@@ -470,7 +470,7 @@ def update_stream_preview(image_b64):
     try:
         img_data = base64.b64decode(image_b64)
         img = Image.open(io.BytesIO(img_data))
-        img.thumbnail((320, 180), Image.LANCZOS)
+        img.thumbnail((640, 360), Image.LANCZOS)
         photo = ImageTk.PhotoImage(img)
         stream_label.config(image=photo, text="")
         stream_label.image = photo
@@ -529,7 +529,7 @@ def snap_from_stream():
 # ---------------------------------------------------------------
 root = tk.Tk()
 root.title("Security Vision — Preston" + (" [DEBUG]" if DEBUG_MODE else ""))
-root.geometry("860x760")
+root.geometry("1100x860")
 root.configure(bg="#0a0a0a")
 root.resizable(True, True)
 
@@ -585,7 +585,7 @@ tk.Label(stream_header, textvariable=stream_status_var, bg="#0a0a0a", fg="#2a6a3
 
 stream_label = tk.Label(stream_panel, bg="#0d1a0d", text="Connecting to stream...",
                          fg="#2a5a2a", font=("Courier New", 9),
-                         width=40, height=10, anchor="center", relief=tk.FLAT)
+                         anchor="center", relief=tk.FLAT)
 stream_label.pack()
 
 # Detected panel
@@ -597,7 +597,7 @@ tk.Label(detected_panel, text="LAST DETECTED (AI CROP)", bg="#0a0a0a", fg="#3333
 
 detected_label = tk.Label(detected_panel, bg="#111111", text="Waiting for event...",
                             fg="#333333", font=("Courier New", 9),
-                            width=40, height=10, anchor="center", relief=tk.FLAT)
+                            anchor="center", relief=tk.FLAT)
 detected_label.pack()
 
 # Output
