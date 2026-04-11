@@ -18,7 +18,7 @@ import logging
 
 # --- Config ---
 OLLAMA_URL = "http://localhost:11434/api/generate"
-DEFAULT_MODEL = "minicpm-v"
+DEFAULT_MODEL = "minicpm-v:latest"
 WEBHOOK_PORT = 8765
 SAVE_DIR = Path(os.path.expanduser("~")) / "SecurityEvents"
 SAVE_DIR.mkdir(exist_ok=True)
@@ -303,8 +303,10 @@ def fetch_models():
         models = [m["name"] for m in resp.json().get("models", [])]
         if models:
             model_dropdown["values"] = models
-            if "minicpm-v" in models:
-                model_var.set("minicpm-v")
+            if "minicpm-v:latest" in models:
+                model_var.set("minicpm-v:latest")
+            elif any("minicpm-v" in m for m in models):
+                model_var.set(next(m for m in models if "minicpm-v" in m))
             else:
                 model_var.set(models[0])
     except Exception as e:
@@ -486,17 +488,32 @@ flask_app = Flask(__name__)
 @flask_app.route("/event", methods=["POST"])
 def event():
     try:
-        data = request.get_json(force=True)
+        raw = request.get_data(as_text=True)
+        data = request.get_json(force=True) or {}
+
+        ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"\n[Webhook] {ts_str} — incoming POST to /event")
+        print(f"[Webhook] payload: {raw[:500]}")  # first 500 chars to avoid flood
+
         alarm = data.get("alarm", {})
         triggers = alarm.get("triggers", [])
         trigger_key = triggers[0].get("key", "unknown") if triggers else "unknown"
+        print(f"[Webhook] trigger_key={trigger_key!r}")
+
         if trigger_key != "line_crossed":
+            print(f"[Webhook] SKIPPED — expected 'line_crossed', got {trigger_key!r}")
+            root.after(0, lambda k=trigger_key: status_var.set(
+                f"⚠️ Webhook received but skipped (trigger={k!r}) — check console"
+            ))
             return "SKIP", 200
+
+        print(f"[Webhook] ACCEPTED — queuing analysis")
         ts_float = time.time()
-        ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         enqueue_event(ts_float, ts_str, source="webhook")
         return "OK", 200
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"[Webhook error] {e}")
         return "ERROR", 500
 
