@@ -28,9 +28,9 @@ STREAM_PREVIEW_INTERVAL = 3000  # ms between live preview refreshes
 
 # Buffer config — defaults (live values come from UI vars after root is created)
 BUFFER_SECONDS = 3.0          # how many seconds of frames to keep
-FRAME_INTERVAL = 0.5          # grab a frame every N seconds for buffer
-SNAP_BACK_SECS = 1.0          # go back this far on webhook
-SNAP_FORWARD_SECS = 0.5       # then grab a frame this far forward
+FRAME_INTERVAL = 0.2          # grab a frame every N seconds for buffer (not tunable)
+SNAP_BEFORE_SECS = 2.5        # frame A: this many seconds before the trigger
+SNAP_AFTER_SECS  = 2.0        # frame B: this many seconds before the trigger (closer)
 CROP_PADDING = 50             # px padding around bounding box
 
 DEBUG_MODE = True             # show debug windows
@@ -97,8 +97,8 @@ def buffer_worker():
         _fail_count = 0
         now = time.time()
 
-        # Throttle: only store a frame every capture-interval seconds
-        if now - _last_frame_ts < frame_interval_var.get():
+        # Throttle: only store a frame every FRAME_INTERVAL seconds
+        if now - _last_frame_ts < FRAME_INTERVAL:
             continue
         _last_frame_ts = now
 
@@ -374,16 +374,10 @@ def queue_worker():
                 save_event_background(None, None, image_bytes, result, None, ts_str)
                 continue
 
-            # --- Get frame A: N seconds BEFORE webhook ---
-            snap_back  = snap_back_var.get()
-            snap_fwd   = snap_forward_var.get()
-            ts_a = trigger_ts - snap_back
+            # Both frames are in the past — no sleeping needed
+            ts_a = trigger_ts - snap_before_var.get()  # further back (frame A)
+            ts_b = trigger_ts - snap_after_var.get()   # closer to trigger (frame B)
             frame_a = get_frame_at(ts_a)
-
-            # --- Get frame B: N seconds AFTER webhook ---
-            # Wait briefly to let the buffer catch up to ts_b
-            time.sleep(snap_fwd + 0.2)
-            ts_b = trigger_ts + snap_fwd
             frame_b = get_frame_at(ts_b)
 
             if frame_a is None or frame_b is None:
@@ -552,11 +546,10 @@ root.geometry("1100x860")
 root.configure(bg="#0a0a0a")
 root.resizable(True, True)
 
-# --- Tunable timing vars ---
-snap_back_var      = tk.DoubleVar(value=SNAP_BACK_SECS)
-snap_forward_var   = tk.DoubleVar(value=SNAP_FORWARD_SECS)
-frame_interval_var = tk.DoubleVar(value=FRAME_INTERVAL)
-buffer_secs_var    = tk.DoubleVar(value=BUFFER_SECONDS)
+# --- Tunable timing vars (all relative to webhook trigger, seconds back in time) ---
+snap_before_var = tk.DoubleVar(value=SNAP_BEFORE_SECS)   # frame A
+snap_after_var  = tk.DoubleVar(value=SNAP_AFTER_SECS)    # frame B (closer to trigger)
+buffer_secs_var = tk.DoubleVar(value=BUFFER_SECONDS)
 
 # Status bar
 status_var = tk.StringVar(value="Starting...")
@@ -687,10 +680,9 @@ def _timing_spin(parent, label, var, from_, to, increment):
     tk.Label(f, text="s", bg="#0a0a0a", fg="#444444",
              font=("Courier New", 8)).pack(side=tk.LEFT, padx=(2, 0))
 
-_timing_spin(timing_frame, "before",   snap_back_var,      0.1, 10.0, 0.1)
-_timing_spin(timing_frame, "after",    snap_forward_var,   0.1, 10.0, 0.1)
-_timing_spin(timing_frame, "capture",  frame_interval_var, 0.1,  5.0, 0.1)
-_timing_spin(timing_frame, "buffer",   buffer_secs_var,    1.0, 30.0, 0.5)
+_timing_spin(timing_frame, "buffer",  buffer_secs_var,  0.5, 30.0, 0.5)
+_timing_spin(timing_frame, "before",  snap_before_var,  0.1, 29.0, 0.1)
+_timing_spin(timing_frame, "after",   snap_after_var,   0.0, 29.0, 0.1)
 
 # Prompt
 tk.Label(root, text="PROMPT", bg="#0a0a0a", fg="#333333",
