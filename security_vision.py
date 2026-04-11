@@ -9,6 +9,7 @@ import os
 import collections
 import io
 import json
+import websocket
 import numpy as np
 import cv2
 from PIL import Image, ImageTk, ImageDraw
@@ -59,6 +60,104 @@ buffer_lock  = threading.Lock()
 
 # --- Area exclusion mask: list of (x1, y1, x2, y2) in native frame pixels ---
 mask_rects = []
+
+# ---------------------------------------------------------------
+# HOME ASSISTANT CONFIG
+# ---------------------------------------------------------------
+HA_HOST  = "192.168.0.209"
+HA_TOKEN = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+            ".eyJpc3MiOiJmMjNkMzE4Nzc1OWY0ZTQ4YTZmOWZhNTYyNjc2ZTE1ZCIsImlhdCI6MTc3NT"
+            "kyMTcxMiwiZXhwIjoyMDkxMjgxNzEyfQ"
+            ".rfCWpPO1-eaeHHlblGrhO4XzzDZtPT1BIMeV5piaEaQ")
+
+WATCHED_ENTITIES = {
+    # Occupancy
+    "binary_sensor.house_occupied_3",
+    "input_boolean.jacob_is_home",
+    "input_boolean.lauren_is_home",
+    # Doors
+    "binary_sensor.front_door_door",
+    "binary_sensor.aqara_door_and_window_sensor_p2_door",
+    "binary_sensor.garage_door_door",
+    # Locks
+    "lock.aqara_smart_lock_u100",
+    "lock.aqara_smart_lock_u100_2",
+    # Garage
+    "cover.smart_garage_door_opener_msg100_main_channel",
+    # Person detected
+    "binary_sensor.side_henrys_room_person_detected",
+    "binary_sensor.front_person_detected",
+    "binary_sensor.front_door_person_detected",
+    "binary_sensor.side_yard_cul_de_sac_person_detected",
+    "binary_sensor.side_yard_street_person_detected",
+    "binary_sensor.patio2_person_detected",
+    "binary_sensor.backyard_person_detected",
+    # Animal detected
+    "binary_sensor.front_animal_detected",
+    "binary_sensor.side_henrys_room_animal_detected",
+    "binary_sensor.front_door_animal_detected",
+    "binary_sensor.side_yard_cul_de_sac_animal_detected",
+    "binary_sensor.side_yard_street_animal_detected",
+    "binary_sensor.patio2_animal_detected",
+    "binary_sensor.backyard_animal_detected",
+}
+
+# Short display names for each entity
+HA_NAMES = {
+    "binary_sensor.house_occupied_3":                         "house occupied",
+    "input_boolean.jacob_is_home":                            "jacob home",
+    "input_boolean.lauren_is_home":                           "lauren home",
+    "binary_sensor.front_door_door":                          "front door",
+    "binary_sensor.aqara_door_and_window_sensor_p2_door":     "back door",
+    "binary_sensor.garage_door_door":                         "garage door",
+    "lock.aqara_smart_lock_u100":                             "lock u100",
+    "lock.aqara_smart_lock_u100_2":                           "lock u100 2",
+    "cover.smart_garage_door_opener_msg100_main_channel":     "garage cover",
+    "binary_sensor.side_henrys_room_person_detected":         "henry's room",
+    "binary_sensor.front_person_detected":                    "front",
+    "binary_sensor.front_door_person_detected":               "front door",
+    "binary_sensor.side_yard_cul_de_sac_person_detected":     "cul-de-sac",
+    "binary_sensor.side_yard_street_person_detected":         "street",
+    "binary_sensor.patio2_person_detected":                   "patio",
+    "binary_sensor.backyard_person_detected":                 "backyard",
+    "binary_sensor.front_animal_detected":                    "front",
+    "binary_sensor.side_henrys_room_animal_detected":         "henry's room",
+    "binary_sensor.front_door_animal_detected":               "front door",
+    "binary_sensor.side_yard_cul_de_sac_animal_detected":     "cul-de-sac",
+    "binary_sensor.side_yard_street_animal_detected":         "street",
+    "binary_sensor.patio2_animal_detected":                   "patio",
+    "binary_sensor.backyard_animal_detected":                 "backyard",
+}
+
+# Groups for display order
+HA_GROUPS = [
+    ("OCCUPANCY",        ["binary_sensor.house_occupied_3",
+                          "input_boolean.jacob_is_home",
+                          "input_boolean.lauren_is_home"]),
+    ("DOORS",            ["binary_sensor.front_door_door",
+                          "binary_sensor.aqara_door_and_window_sensor_p2_door",
+                          "binary_sensor.garage_door_door"]),
+    ("LOCKS",            ["lock.aqara_smart_lock_u100",
+                          "lock.aqara_smart_lock_u100_2"]),
+    ("GARAGE",           ["cover.smart_garage_door_opener_msg100_main_channel"]),
+    ("PERSON DETECTED",  ["binary_sensor.front_person_detected",
+                          "binary_sensor.front_door_person_detected",
+                          "binary_sensor.side_henrys_room_person_detected",
+                          "binary_sensor.side_yard_cul_de_sac_person_detected",
+                          "binary_sensor.side_yard_street_person_detected",
+                          "binary_sensor.patio2_person_detected",
+                          "binary_sensor.backyard_person_detected"]),
+    ("ANIMAL DETECTED",  ["binary_sensor.front_animal_detected",
+                          "binary_sensor.front_door_animal_detected",
+                          "binary_sensor.side_henrys_room_animal_detected",
+                          "binary_sensor.side_yard_cul_de_sac_animal_detected",
+                          "binary_sensor.side_yard_street_animal_detected",
+                          "binary_sensor.patio2_animal_detected",
+                          "binary_sensor.backyard_animal_detected"]),
+]
+
+ha_state      = {}          # entity_id -> state string
+ha_row_labels = {}          # entity_id -> {"dot": Label, "val": Label}
 
 # ---------------------------------------------------------------
 # FRAME BUFFER WORKER
@@ -512,6 +611,82 @@ def update_stream_preview(image_b64):
         stream_status_var.set("⚠️ Preview error")
 
 # ---------------------------------------------------------------
+# HOME ASSISTANT WEBSOCKET WORKER
+# ---------------------------------------------------------------
+def _ha_is_active(state):
+    return state in ("on", "open", "unlocked", "detected", "playing", "home", "true")
+
+def _ha_apply_entity(entity_id, state):
+    """Update dict + UI labels for one entity (call via root.after on main thread)."""
+    ha_state[entity_id] = state
+    if entity_id not in ha_row_labels:
+        return
+    row = ha_row_labels[entity_id]
+    active = _ha_is_active(state)
+    row["dot"].config(text="●" if active else "○",
+                      fg="#00ff88" if active else "#444444")
+    row["val"].config(text=state,
+                      fg="#00ff88" if active else "#666666")
+
+def ha_worker():
+    while True:
+        try:
+            ws = websocket.create_connection(
+                f"ws://{HA_HOST}:8123/api/websocket",
+                timeout=15
+            )
+            root.after(0, lambda: ha_status_var.set("⟳  Authenticating..."))
+
+            # 1. auth_required → send token
+            msg = json.loads(ws.recv())
+            assert msg.get("type") == "auth_required", f"Expected auth_required, got {msg}"
+            ws.send(json.dumps({"type": "auth", "access_token": HA_TOKEN}))
+
+            # 2. auth_ok
+            msg = json.loads(ws.recv())
+            assert msg.get("type") == "auth_ok", f"Auth failed: {msg}"
+            root.after(0, lambda: ha_status_var.set("⟳  Fetching states..."))
+
+            # 3. get_states
+            ws.send(json.dumps({"id": 1, "type": "get_states"}))
+
+            # 4. subscribe to state_changed
+            ws.send(json.dumps({"id": 2, "type": "subscribe_events",
+                                "event_type": "state_changed"}))
+
+            # 5. process messages indefinitely
+            while True:
+                raw = ws.recv()
+                msg = json.loads(raw)
+
+                if msg.get("id") == 1 and msg.get("type") == "result":
+                    # Initial state dump
+                    for s in msg.get("result", []):
+                        eid = s.get("entity_id", "")
+                        if eid in WATCHED_ENTITIES:
+                            state = s.get("state", "unknown")
+                            root.after(0, lambda e=eid, st=state: _ha_apply_entity(e, st))
+                    root.after(0, lambda: ha_status_var.set("● Connected"))
+                    print("[HA] Initial states loaded")
+
+                elif msg.get("type") == "event":
+                    edata = msg.get("event", {}).get("data", {})
+                    eid   = edata.get("entity_id", "")
+                    if eid in WATCHED_ENTITIES:
+                        state = (edata.get("new_state") or {}).get("state", "unknown")
+                        root.after(0, lambda e=eid, st=state: _ha_apply_entity(e, st))
+                        print(f"[HA] {eid} → {state}")
+
+        except Exception as e:
+            print(f"[HA] Disconnected: {e} — retrying in 10s")
+            root.after(0, lambda: ha_status_var.set("○ Disconnected — retrying..."))
+            try:
+                ws.close()
+            except Exception:
+                pass
+            time.sleep(10)
+
+# ---------------------------------------------------------------
 # FLASK WEBHOOK
 # ---------------------------------------------------------------
 flask_app = Flask(__name__)
@@ -946,11 +1121,15 @@ _timing_spin(timing_frame, "padding",  crop_padding_var, 0,   500,  10,  unit="p
 _timing_spin(timing_frame, "min box",  min_box_pct_var,  0.0, 10.0, 0.01, unit="%")
 
 # ═══════════════════════════════════════════════
-# TAB 2 — MASTER
+# TAB 2 — MASTER  (left controls | right HA panel)
 # ═══════════════════════════════════════════════
 
-master_inner = tk.Frame(tab_master, bg="#0a0a0a")
-master_inner.pack(fill=tk.BOTH, expand=True, padx=24, pady=16)
+master_cols = tk.Frame(tab_master, bg="#0a0a0a")
+master_cols.pack(fill=tk.BOTH, expand=True)
+
+# ── LEFT COLUMN ──────────────────────────────
+master_left = tk.Frame(master_cols, bg="#0a0a0a")
+master_left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(20, 10), pady=16)
 
 # System on/off toggle
 def _update_toggle(*_):
@@ -967,10 +1146,10 @@ def _update_toggle(*_):
 
 system_active_var.trace_add("write", _update_toggle)
 
-tk.Label(master_inner, text="SYSTEM", bg="#0a0a0a", fg="#444444",
+tk.Label(master_left, text="SYSTEM", bg="#0a0a0a", fg="#444444",
          font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 4))
 toggle_btn = tk.Button(
-    master_inner, text="● SYSTEM  ON",
+    master_left, text="● SYSTEM  ON",
     command=lambda: system_active_var.set(not system_active_var.get()),
     bg="#111111", fg="#00ff88", font=("Courier New", 14, "bold"),
     relief=tk.FLAT, padx=20, pady=14, cursor="hand2",
@@ -978,28 +1157,28 @@ toggle_btn = tk.Button(
 toggle_btn.pack(anchor="w", pady=(0, 20))
 
 # Camera name
-tk.Label(master_inner, text="CAMERA TAB NAME", bg="#0a0a0a", fg="#444444",
+tk.Label(master_left, text="CAMERA TAB NAME", bg="#0a0a0a", fg="#444444",
          font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 4))
-tk.Entry(master_inner, textvariable=cam_name_var,
+tk.Entry(master_left, textvariable=cam_name_var,
          bg="#111111", fg="#00ff88", font=("Courier New", 11),
          relief=tk.FLAT, insertbackground="#00ff88",
          selectbackground="#003322", width=30
          ).pack(anchor="w", pady=(0, 20))
 
 # Model
-tk.Label(master_inner, text="MODEL", bg="#0a0a0a", fg="#444444",
+tk.Label(master_left, text="MODEL", bg="#0a0a0a", fg="#444444",
          font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 4))
-model_dropdown = ttk.Combobox(master_inner, textvariable=model_var,
+model_dropdown = ttk.Combobox(master_left, textvariable=model_var,
                                font=("Courier New", 10), style="Dark.TCombobox",
                                state="readonly", width=32)
 model_dropdown.pack(anchor="w", pady=(0, 20))
-tk.Label(master_inner, text=f"💾  {SAVE_DIR}", bg="#0a0a0a", fg="#333333",
+tk.Label(master_left, text=f"💾  {SAVE_DIR}", bg="#0a0a0a", fg="#333333",
          font=("Courier New", 8)).pack(anchor="w", pady=(0, 20))
 
 # Prompt
-tk.Label(master_inner, text="PROMPT", bg="#0a0a0a", fg="#444444",
+tk.Label(master_left, text="PROMPT", bg="#0a0a0a", fg="#444444",
          font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 4))
-prompt_frame = tk.Frame(master_inner, bg="#0a0a0a")
+prompt_frame = tk.Frame(master_left, bg="#0a0a0a")
 prompt_frame.pack(fill=tk.BOTH, expand=True)
 prompt_text = tk.Text(prompt_frame, bg="#111111", fg="#999999",
     font=("Courier New", 9), relief=tk.FLAT, padx=10, pady=8,
@@ -1012,14 +1191,66 @@ prompt_text.insert(tk.END, DEFAULT_PROMPT)
 prompt_text.bind("<KeyRelease>", schedule_save)
 prompt_text.bind("<<Paste>>",    schedule_save)
 
+# ── RIGHT COLUMN — HOME ASSISTANT ────────────
+master_right = tk.Frame(master_cols, bg="#0d0d0d", width=320)
+master_right.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 0), pady=0)
+master_right.pack_propagate(False)
+
+# Header
+ha_header = tk.Frame(master_right, bg="#0d0d0d")
+ha_header.pack(fill=tk.X, padx=12, pady=(14, 6))
+tk.Label(ha_header, text="HOME ASSISTANT", bg="#0d0d0d", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(side=tk.LEFT)
+ha_status_var = tk.StringVar(value="○ Disconnected")
+tk.Label(ha_header, textvariable=ha_status_var, bg="#0d0d0d", fg="#336633",
+         font=("Courier New", 8)).pack(side=tk.LEFT, padx=(8, 0))
+
+# Scrollable entity list
+ha_canvas = tk.Canvas(master_right, bg="#0d0d0d", highlightthickness=0)
+ha_scroll = tk.Scrollbar(master_right, orient="vertical",
+                          command=ha_canvas.yview, bg="#111111")
+ha_canvas.configure(yscrollcommand=ha_scroll.set)
+ha_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+ha_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+ha_list = tk.Frame(ha_canvas, bg="#0d0d0d")
+ha_canvas_window = ha_canvas.create_window((0, 0), window=ha_list, anchor="nw")
+
+def _ha_canvas_resize(e):
+    ha_canvas.configure(scrollregion=ha_canvas.bbox("all"))
+    ha_canvas.itemconfig(ha_canvas_window, width=e.width)
+ha_canvas.bind("<Configure>", _ha_canvas_resize)
+
+# Build entity rows grouped
+for group_name, entities in HA_GROUPS:
+    tk.Label(ha_list, text=group_name, bg="#0d0d0d", fg="#333333",
+             font=("Courier New", 7, "bold"), padx=12, pady=(8, 2),
+             anchor="w").pack(fill=tk.X)
+    for eid in entities:
+        row = tk.Frame(ha_list, bg="#0d0d0d")
+        row.pack(fill=tk.X, padx=12, pady=1)
+        dot_lbl = tk.Label(row, text="○", bg="#0d0d0d", fg="#333333",
+                           font=("Courier New", 10, "bold"), width=2)
+        dot_lbl.pack(side=tk.LEFT)
+        tk.Label(row, text=HA_NAMES.get(eid, eid), bg="#0d0d0d", fg="#555555",
+                 font=("Courier New", 8), width=16, anchor="w").pack(side=tk.LEFT)
+        val_lbl = tk.Label(row, text="—", bg="#0d0d0d", fg="#444444",
+                           font=("Courier New", 8), anchor="w")
+        val_lbl.pack(side=tk.LEFT)
+        ha_row_labels[eid] = {"dot": dot_lbl, "val": val_lbl}
+
+ha_list.update_idletasks()
+ha_canvas.configure(scrollregion=ha_canvas.bbox("all"))
+
 # ---------------------------------------------------------------
 # START SERVICES
 # ---------------------------------------------------------------
 load_config()   # apply saved settings before threads start
 
-threading.Thread(target=run_flask, daemon=True).start()
+threading.Thread(target=run_flask,    daemon=True).start()
 threading.Thread(target=queue_worker, daemon=True).start()
 threading.Thread(target=buffer_worker, daemon=True).start()
 threading.Thread(target=warmup_model, daemon=True).start()
+threading.Thread(target=ha_worker,    daemon=True).start()
 
 root.mainloop()
