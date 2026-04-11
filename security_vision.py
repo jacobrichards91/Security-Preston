@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import filedialog, ttk
 import threading
 import queue
+import heapq
 import re
 import requests
 import base64
@@ -77,7 +78,51 @@ Be brief and direct. If clearly benign, say so."""
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 
-analysis_queue = queue.Queue()
+# ---------------------------------------------------------------
+# PRIORITY QUEUE  (newest-first — most recent detection processed first)
+# ---------------------------------------------------------------
+class NewestFirstQueue:
+    """Thread-safe priority queue: highest timestamp = processed first."""
+    def __init__(self):
+        self._heap    = []          # (neg_ts, seq, item)
+        self._lock    = threading.Condition()
+        self._seq     = 0
+        self._all     = []          # parallel list for display (newest first)
+
+    def put(self, item, ts):
+        with self._lock:
+            heapq.heappush(self._heap, (-ts, self._seq, item))
+            self._seq += 1
+            # rebuild display list sorted newest→oldest
+            self._all = [i for (_, _, i) in sorted(self._heap)]
+            self._lock.notify()
+
+    def get(self):
+        """Block until an item is available, return it (newest first)."""
+        with self._lock:
+            while not self._heap:
+                self._lock.wait()
+            _, _, item = heapq.heappop(self._heap)
+            self._all = [i for (_, _, i) in sorted(self._heap)]
+            return item
+
+    def peek_all(self):
+        """Return waiting items sorted newest → oldest (for display only)."""
+        with self._lock:
+            return list(self._all)
+
+    def qsize(self):
+        with self._lock:
+            return len(self._heap)
+
+    def task_done(self):
+        pass  # compatibility shim
+
+analysis_queue = NewestFirstQueue()
+
+# State exposed to the queue-detail popup
+_queue_current = None   # item dict currently running, or None
+_queue_stage   = ""     # "diff" | "vision" | "judgment" | ""
 
 # --- Rolling frame buffer: deque of (timestamp, image_bytes) ---
 frame_buffer = collections.deque()
@@ -737,21 +782,138 @@ def build_ha_context():
     return "\n".join(lines)
 
 def update_queue_status():
-    qsize = analysis_queue.qsize()
+    qsize    = analysis_queue.qsize()
     buf_size = len(frame_buffer)
-    if qsize > 0:
-        status_var.set(f"✅ Ready — webhook :{WEBHOOK_PORT} — 📋 {qsize} queued — 🎞 {buf_size} frames buffered")
+    processing = _queue_current is not None
+    if qsize > 0 or processing:
+        status_var.set(f"✅ Ready — webhook :{WEBHOOK_PORT} — 📋 {qsize} waiting — 🎞 {buf_size} frames buffered")
     else:
         status_var.set(f"✅ Ready — webhook :{WEBHOOK_PORT} — 🎞 {buf_size} frames buffered")
+
+# UI ref for the queue badge button in Master tab (set during UI build)
+_queue_badge_var = None
+
+def _refresh_queue_badge(*_):
+    """Update the clickable queue badge at the top of the Master tab."""
+    if _queue_badge_var is None:
+        return
+    qsize   = analysis_queue.qsize()
+    current = _queue_current
+    stage   = _queue_stage
+    stage_label = {"diff": "diffing", "vision": "vision model",
+                   "judgment": "judgment model"}.get(stage, "processing")
+
+    if current is None and qsize == 0:
+        _queue_badge_var.set("  ● IDLE  —  click for queue detail")
+        try: queue_badge.config(fg="#333333")
+        except Exception: pass
+    elif current is not None and qsize == 0:
+        _queue_badge_var.set(f"  ⏳ {stage_label}  —  nothing waiting")
+        try: queue_badge.config(fg="#00aaff")
+        except Exception: pass
+    else:
+        _queue_badge_var.set(f"  ⏳ {stage_label}  —  📋 {qsize} waiting  (click for detail)")
+        try: queue_badge.config(fg="#ffaa00")
+        except Exception: pass
+
+_queue_win = None
+
+def open_queue_window():
+    global _queue_win
+    if _queue_win and _queue_win.winfo_exists():
+        _queue_win.lift()
+        return
+
+    _queue_win = tk.Toplevel(root)
+    _queue_win.title("Detection Queue")
+    _queue_win.configure(bg="#0a0a0a")
+    _queue_win.geometry("520x420")
+    _queue_win.resizable(True, True)
+
+    # --- CURRENTLY PROCESSING ---
+    tk.Label(_queue_win, text="PROCESSING", bg="#0a0a0a", fg="#444444",
+             font=("Courier New", 8, "bold"), anchor="w", padx=14).pack(fill=tk.X, pady=(14, 4))
+
+    curr_frame = tk.Frame(_queue_win, bg="#111111")
+    curr_frame.pack(fill=tk.X, padx=14, pady=(0, 8))
+    curr_dot  = tk.Label(curr_frame, text="○", bg="#111111", fg="#333333",
+                          font=("Courier New", 11, "bold"), padx=8)
+    curr_dot.pack(side=tk.LEFT)
+    curr_lbl  = tk.Label(curr_frame, text="idle", bg="#111111", fg="#555555",
+                          font=("Courier New", 10), anchor="w", pady=6)
+    curr_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+    curr_stage = tk.Label(curr_frame, text="", bg="#111111", fg="#00aaff",
+                           font=("Courier New", 9, "bold"), padx=8)
+    curr_stage.pack(side=tk.RIGHT)
+
+    # --- WAITING ---
+    tk.Label(_queue_win, text="WAITING  (newest first)", bg="#0a0a0a", fg="#444444",
+             font=("Courier New", 8, "bold"), anchor="w", padx=14).pack(fill=tk.X, pady=(4, 4))
+
+    list_frame = tk.Frame(_queue_win, bg="#0a0a0a")
+    list_frame.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 14))
+    list_text = tk.Text(list_frame, bg="#111111", fg="#555555",
+                        font=("Courier New", 9), relief=tk.FLAT,
+                        padx=10, pady=8, wrap=tk.WORD, state=tk.DISABLED,
+                        selectbackground="#003322")
+    list_scroll = tk.Scrollbar(list_frame, command=list_text.yview, bg="#111111")
+    list_text.configure(yscrollcommand=list_scroll.set)
+    list_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+    list_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    stage_names = {"diff": "🔬 motion diff", "vision": "👁 vision model",
+                   "judgment": "🧠 judgment model"}
+
+    def _refresh_win():
+        if not _queue_win.winfo_exists():
+            return
+        # Currently processing
+        cur = _queue_current
+        if cur:
+            ts   = cur.get("ts_str", "—")
+            src  = cur.get("source", "webhook")
+            curr_dot.config(text="●", fg="#00ff88")
+            curr_lbl.config(text=f"{ts}  [{src}]", fg="#e0e0e0")
+            curr_stage.config(text=stage_names.get(_queue_stage, _queue_stage))
+        else:
+            curr_dot.config(text="○", fg="#333333")
+            curr_lbl.config(text="idle", fg="#555555")
+            curr_stage.config(text="")
+        # Waiting items
+        waiting = analysis_queue.peek_all()
+        list_text.config(state=tk.NORMAL)
+        list_text.delete("1.0", tk.END)
+        if not waiting:
+            list_text.insert(tk.END, "— queue empty —")
+        else:
+            for i, it in enumerate(waiting, 1):
+                ts  = it.get("ts_str", "—")
+                src = it.get("source", "webhook")
+                list_text.insert(tk.END, f"  {i}.  {ts}  [{src}]\n")
+        list_text.config(state=tk.DISABLED)
+        _queue_win.after(400, _refresh_win)
+
+    _refresh_win()
 
 # ---------------------------------------------------------------
 # QUEUE WORKER
 # ---------------------------------------------------------------
+def _set_stage(stage, ts_str=""):
+    global _queue_stage
+    _queue_stage = stage
+    root.after(0, _refresh_queue_badge)
+    label = {"diff": "🔬 Motion diff", "vision": "👁 Vision",
+             "judgment": "🧠 Judgment"}.get(stage, "📡 Processing")
+    root.after(0, lambda l=label, t=ts_str: status_var.set(
+        f"{l} [{t}]" + (f" — {analysis_queue.qsize()} waiting" if analysis_queue.qsize() else "")))
+
 def queue_worker():
+    global _queue_current, _queue_stage
     while True:
         item = analysis_queue.get()
+        _queue_current = item
+        root.after(0, _refresh_queue_badge)
         try:
-            trigger_ts    = item["trigger_ts"]
             ts_str        = item["ts_str"]
             vision_model  = item["vision_model"]
             text_model    = item["text_model"]
@@ -759,16 +921,14 @@ def queue_worker():
             text_prompt   = item["text_prompt"]
             source        = item.get("source", "webhook")
 
-            root.after(0, lambda t=ts_str: status_var.set(f"📡 Processing event [{t}]"))
-
             if source == "manual":
                 image_bytes = base64.b64decode(item["image_b64"])
-                root.after(0, lambda t=ts_str: status_var.set(f"👁 Vision [{t}]"))
+                _set_stage("vision", ts_str)
                 t0 = time.time()
                 vision_result = analyze_image_bytes(image_bytes, vision_prompt, vision_model)
                 check_synthetic_sensors(vision_result)
 
-                root.after(0, lambda t=ts_str: status_var.set(f"🧠 Judgment [{t}]"))
+                _set_stage("judgment", ts_str)
                 chicago_now = datetime.now(CHICAGO_TZ).strftime("%A %B %d %Y  %I:%M:%S %p %Z")
                 full_text_prompt = (
                     f"{text_prompt}\n\n"
@@ -786,22 +946,16 @@ def queue_worker():
                 save_event_background(None, None, image_bytes, text_result, None, ts_str)
                 continue
 
-            # --- Grab frames (both in the past) ---
-            ts_a = trigger_ts - snap_before_var.get()
-            ts_b = trigger_ts - snap_after_var.get()
-            frame_a = get_frame_at(ts_a)
-            frame_b = get_frame_at(ts_b)
+            # --- Use pre-captured frames (grabbed at enqueue time) ---
+            frame_a = item.get("frame_a")
+            frame_b = item.get("frame_b")
 
             if frame_a is None or frame_b is None:
                 root.after(0, lambda t=ts_str: status_var.set(
-                    f"⚠️ [{t}] Buffer miss — not enough frames"))
+                    f"⚠️ [{t}] No frames captured at trigger time"))
                 continue
 
-            if mask_rects:
-                frame_a = jpeg_apply_mask(frame_a)
-                frame_b = jpeg_apply_mask(frame_b)
-
-            root.after(0, lambda t=ts_str: status_var.set(f"🔬 Motion diff [{t}]"))
+            _set_stage("diff", ts_str)
             cropped_bytes, debug_imgs, bbox = compute_motion_crop(frame_a, frame_b)
 
             if debug_imgs:
@@ -814,21 +968,16 @@ def queue_worker():
             crop_b64 = base64.b64encode(cropped_bytes).decode()
             root.after(0, lambda b=crop_b64: show_detected_image(b))
 
-            # --- Distance classification ---
             distance = compute_distance(bbox)
             if distance:
                 root.after(0, lambda d=distance: _update_distance_display(d))
 
-            # --- Stage 1: Vision model ---
-            qsize = analysis_queue.qsize()
-            root.after(0, lambda q=qsize, t=ts_str: status_var.set(
-                f"👁 Vision [{t}]" + (f" — {q} queued" if q else "")))
+            _set_stage("vision", ts_str)
             t0 = time.time()
             vision_result = analyze_image_bytes(cropped_bytes, vision_prompt, vision_model)
             check_synthetic_sensors(vision_result)
 
-            # --- Stage 2: Text model with full context ---
-            root.after(0, lambda t=ts_str: status_var.set(f"🧠 Judgment [{t}]"))
+            _set_stage("judgment", ts_str)
             chicago_now = datetime.now(CHICAGO_TZ).strftime("%A %B %d %Y  %I:%M:%S %p %Z")
             distance_line = f"\nDistance from house: {distance}" if distance else ""
             full_text_prompt = (
@@ -854,7 +1003,10 @@ def queue_worker():
             traceback.print_exc()
             root.after(0, lambda err=str(e): status_var.set(f"⚠️ Error: {err}"))
         finally:
+            _queue_current = None
+            _queue_stage   = ""
             analysis_queue.task_done()
+            root.after(0, _refresh_queue_badge)
             root.after(0, update_queue_status)
 
 def finish_analysis(image_b64, vision_result, text_input, text_result, ts, elapsed):
@@ -897,6 +1049,23 @@ def finish_analysis(image_b64, vision_result, text_input, text_result, ts, elaps
     update_queue_status()
 
 def enqueue_event(ts_float, ts_str, source="webhook", image_b64=None):
+    """
+    Capture frames from the rolling buffer RIGHT NOW (before they can roll off),
+    then add the item to the priority queue for processing.
+    """
+    # --- Capture frames immediately so buffer-rolloff can't lose them ---
+    frame_a = None
+    frame_b = None
+    if source == "webhook":
+        ts_a = ts_float - snap_before_var.get()
+        ts_b = ts_float - snap_after_var.get()
+        frame_a = get_frame_at(ts_a)
+        frame_b = get_frame_at(ts_b)
+        if frame_a and mask_rects:
+            frame_a = jpeg_apply_mask(frame_a)
+        if frame_b and mask_rects:
+            frame_b = jpeg_apply_mask(frame_b)
+
     item = {
         "trigger_ts":    ts_float,
         "ts_str":        ts_str,
@@ -905,12 +1074,15 @@ def enqueue_event(ts_float, ts_str, source="webhook", image_b64=None):
         "vision_prompt": vision_prompt_text.get("1.0", tk.END).strip(),
         "text_prompt":   text_prompt_text.get("1.0", tk.END).strip(),
         "source":        source,
+        "frame_a":       frame_a,   # pre-captured (may be None for manual)
+        "frame_b":       frame_b,
+        "enqueued_at":   ts_float,
     }
     if image_b64:
         item["image_b64"] = image_b64
-    analysis_queue.put(item)
-    qsize = analysis_queue.qsize()
-    root.after(0, lambda q=qsize: status_var.set(f"📋 Event queued — {q} in queue"))
+
+    analysis_queue.put(item, ts_float)
+    root.after(0, _refresh_queue_badge)
 
 def show_detected_image(image_b64):
     try:
@@ -1513,8 +1685,19 @@ _timing_spin(timing_frame, "padding",  crop_padding_var, 0,   500,  10,  unit="p
 _timing_spin(timing_frame, "min box",  min_box_pct_var,  0.0, 10.0, 0.01, unit="%")
 
 # ═══════════════════════════════════════════════
-# TAB 2 — MASTER  (left controls | right HA panel)
+# TAB 2 — MASTER  (queue badge | left controls | right HA panel)
 # ═══════════════════════════════════════════════
+
+# Queue status badge — top of Master tab, click to open detail window
+_queue_badge_var = tk.StringVar(value="● idle")
+queue_badge = tk.Button(
+    tab_master, textvariable=_queue_badge_var,
+    command=open_queue_window,
+    bg="#0d0d0d", fg="#333333", activebackground="#1a1a1a", activeforeground="#00ff88",
+    font=("Courier New", 9, "bold"), relief=tk.FLAT, anchor="w",
+    padx=14, pady=6, cursor="hand2", bd=0)
+queue_badge.pack(fill=tk.X, side=tk.TOP)
+tk.Frame(tab_master, bg="#1a1a1a", height=1).pack(fill=tk.X, side=tk.TOP)
 
 master_cols = tk.Frame(tab_master, bg="#0a0a0a")
 master_cols.pack(fill=tk.X, expand=False)
