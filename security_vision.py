@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import filedialog, ttk
 import threading
 import queue
+import re
 import requests
 import base64
 import time
@@ -93,6 +94,118 @@ far_zone = None
 # Placeholder refs for the distance sensor labels in the HA panel (set during UI build)
 distance_dot_lbl = None
 distance_val_lbl = None
+
+# ---------------------------------------------------------------
+# SYNTHETIC SENSORS  (derived from vision model output)
+# ---------------------------------------------------------------
+_synth          = {"child": False, "resident": False}
+_child_timer    = None   # threading.Timer — auto-off after 5 min
+_resident_timer = None
+
+# UI label refs (assigned during HA panel build)
+synth_child_dot  = None;  synth_child_val  = None
+synth_res_dot    = None;  synth_res_val    = None
+synth_emerg_dot  = None;  synth_emerg_val  = None
+
+# Keywords/patterns the vision model might use
+_CHILD_KEYWORDS = [
+    "child", "children", "baby", "babies", "toddler", "toddlers",
+    "infant", "infants", "kid ", "kids ", "young child", "small child",
+    "little one", "little ones", "youngster", "youngsters", "minor",
+]
+
+_RESIDENT_PATTERNS = [re.compile(p, re.IGNORECASE) for p in [
+    # Woman with brown / dark hair
+    r"woman.{0,50}brown\s*hair",       r"brown\s*hair.{0,50}woman",
+    r"female.{0,50}brown\s*hair",      r"brown\s*hair.{0,50}female",
+    r"lady.{0,50}brown\s*hair",        r"brown\s*hair.{0,50}lady",
+    r"woman.{0,50}dark\s*hair",        r"dark\s*hair.{0,50}woman",
+    r"female.{0,50}dark\s*hair",       r"dark\s*hair.{0,50}female",
+    r"brunette",
+    r"brown[\-\s]haired\s+\w*\s*(woman|female|lady|girl)",
+    r"(woman|female|lady|girl)\s+\w*\s*brown[\-\s]hair",
+    r"adult\s+female.{0,50}(brown|dark)\s*hair",
+    r"(brown|dark)\s*hair.{0,50}adult\s+female",
+    # Man with brown / black / dark hair
+    r"man.{0,50}brown\s*hair",         r"brown\s*hair.{0,50}man",
+    r"man.{0,50}black\s*hair",         r"black\s*hair.{0,50}man",
+    r"man.{0,50}dark\s*hair",          r"dark\s*hair.{0,50}man",
+    r"male.{0,50}brown\s*hair",        r"brown\s*hair.{0,50}male",
+    r"male.{0,50}black\s*hair",        r"black\s*hair.{0,50}male",
+    r"male.{0,50}dark\s*hair",         r"dark\s*hair.{0,50}male",
+    r"guy.{0,50}(brown|black|dark)\s*hair",
+    r"(brown|black|dark)\s*hair.{0,50}guy",
+    r"brown[\-\s]haired\s+\w*\s*(man|male|guy|person)",
+    r"black[\-\s]haired\s+\w*\s*(man|male|guy|person)",
+    r"dark[\-\s]haired\s+\w*\s*(man|male|guy|person)",
+    r"adult\s+male.{0,50}(brown|black|dark)\s*hair",
+    r"(brown|black|dark)\s*hair.{0,50}adult\s+male",
+    r"adult.{0,50}(brown|black|dark)\s*hair",
+    r"person.{0,50}(brown|black|dark)\s*hair",
+    r"individual.{0,50}(brown|black|dark)\s*hair",
+    r"man\s+with\s+(short|long|medium|curly|straight)?\s*(brown|black|dark)\s*hair",
+    r"woman\s+with\s+(short|long|medium|curly|straight)?\s*(brown|dark)\s*hair",
+]]
+
+
+def _apply_synth_row(dot, val, active, text, alert=False):
+    if dot is None:
+        return
+    if alert and active:
+        dot.config(text="●", fg="#ff2222")
+        val.config(text=text, fg="#ff2222")
+    elif active:
+        dot.config(text="●", fg="#00ff88")
+        val.config(text=text, fg="#00ff88")
+    else:
+        dot.config(text="○", fg="#444444")
+        val.config(text=text, fg="#666666")
+
+
+def _refresh_synth_ui():
+    """Recompute derived states and update all 3 synthetic sensor rows. Main thread only."""
+    child    = _synth["child"]
+    resident = _synth["resident"]
+    emerg    = child and not resident
+    _apply_synth_row(synth_child_dot, synth_child_val,
+                     child,    "detected" if child else "clear")
+    _apply_synth_row(synth_res_dot,   synth_res_val,
+                     resident, "detected" if resident else "clear")
+    _apply_synth_row(synth_emerg_dot, synth_emerg_val,
+                     emerg,    "ACTIVE" if emerg else "clear", alert=emerg)
+
+
+def _set_synth(key, value):
+    """Set one synthetic sensor flag and refresh UI. Must run on main thread."""
+    _synth[key] = value
+    _refresh_synth_ui()
+
+
+def check_synthetic_sensors(vision_result):
+    """
+    Parse vision model output and update child / resident synthetic sensors.
+    Safe to call from any thread — UI updates are marshalled via root.after.
+    """
+    global _child_timer, _resident_timer
+    text = vision_result.lower()
+
+    # Child detection
+    if any(kw in text for kw in _CHILD_KEYWORDS):
+        if _child_timer:
+            _child_timer.cancel()
+        _child_timer = threading.Timer(300, lambda: root.after(0, lambda: _set_synth("child", False)))
+        _child_timer.daemon = True
+        _child_timer.start()
+        root.after(0, lambda: _set_synth("child", True))
+
+    # Resident (Jacob / Lauren) detection
+    if any(p.search(text) for p in _RESIDENT_PATTERNS):
+        if _resident_timer:
+            _resident_timer.cancel()
+        _resident_timer = threading.Timer(300, lambda: root.after(0, lambda: _set_synth("resident", False)))
+        _resident_timer.daemon = True
+        _resident_timer.start()
+        root.after(0, lambda: _set_synth("resident", True))
 
 # ---------------------------------------------------------------
 # HOME ASSISTANT CONFIG
@@ -552,6 +665,16 @@ def analyze_text(prompt, model):
 def build_ha_context():
     """Format current HA state into a readable string for the text model."""
     lines = []
+    # Synthetic sensors first
+    child    = _synth["child"]
+    resident = _synth["resident"]
+    emerg    = child and not resident
+    lines.append(
+        f"SYNTHETIC SENSORS: "
+        f"child_detected={'on' if child else 'off'}, "
+        f"jacob_lauren_detected={'on' if resident else 'off'}, "
+        f"emergency_child_alone={'on' if emerg else 'off'}"
+    )
     for group_name, entities in HA_GROUPS:
         parts = [f"{HA_NAMES.get(e, e)}={ha_state.get(e, 'unknown')}" for e in entities]
         lines.append(f"{group_name}: {', '.join(parts)}")
@@ -587,6 +710,7 @@ def queue_worker():
                 root.after(0, lambda t=ts_str: status_var.set(f"👁 Vision [{t}]"))
                 t0 = time.time()
                 vision_result = analyze_image_bytes(image_bytes, vision_prompt, vision_model)
+                check_synthetic_sensors(vision_result)
 
                 root.after(0, lambda t=ts_str: status_var.set(f"🧠 Judgment [{t}]"))
                 chicago_now = datetime.now(CHICAGO_TZ).strftime("%A %B %d %Y  %I:%M:%S %p %Z")
@@ -645,6 +769,7 @@ def queue_worker():
                 f"👁 Vision [{t}]" + (f" — {q} queued" if q else "")))
             t0 = time.time()
             vision_result = analyze_image_bytes(cropped_bytes, vision_prompt, vision_model)
+            check_synthetic_sensors(vision_result)
 
             # --- Stage 2: Text model with full context ---
             root.after(0, lambda t=ts_str: status_var.set(f"🧠 Judgment [{t}]"))
@@ -1473,6 +1598,20 @@ def _ha_canvas_resize(e):
     ha_canvas.itemconfig(ha_canvas_window, width=e.width)
 ha_canvas.bind("<Configure>", _ha_canvas_resize)
 
+# Helper to build a generic sensor row in the HA list
+def _ha_sensor_row(label_text, init_val="—"):
+    row = tk.Frame(ha_list, bg="#0d0d0d")
+    row.pack(fill=tk.X, padx=12, pady=1)
+    dot = tk.Label(row, text="○", bg="#0d0d0d", fg="#333333",
+                   font=("Courier New", 10, "bold"), width=2)
+    dot.pack(side=tk.LEFT)
+    tk.Label(row, text=label_text, bg="#0d0d0d", fg="#555555",
+             font=("Courier New", 8), width=16, anchor="w").pack(side=tk.LEFT)
+    val = tk.Label(row, text=init_val, bg="#0d0d0d", fg="#444444",
+                   font=("Courier New", 8), anchor="w")
+    val.pack(side=tk.LEFT)
+    return dot, val
+
 # Build entity rows grouped
 for group_name, entities in HA_GROUPS:
     tk.Label(ha_list, text=group_name, bg="#0d0d0d", fg="#333333",
@@ -1490,6 +1629,22 @@ for group_name, entities in HA_GROUPS:
                            font=("Courier New", 8), anchor="w")
         val_lbl.pack(side=tk.LEFT)
         ha_row_labels[eid] = {"dot": dot_lbl, "val": val_lbl}
+
+    # Inject synthetic sensors under OCCUPANCY
+    if group_name == "OCCUPANCY":
+        synth_child_dot, synth_child_val = _ha_sensor_row("child detected",  "clear")
+        synth_res_dot,   synth_res_val   = _ha_sensor_row("jacob/lauren",    "clear")
+        # Emergency row — slightly indented label to show it's derived
+        emerg_row = tk.Frame(ha_list, bg="#0d0d0d")
+        emerg_row.pack(fill=tk.X, padx=12, pady=1)
+        synth_emerg_dot = tk.Label(emerg_row, text="○", bg="#0d0d0d", fg="#333333",
+                                   font=("Courier New", 10, "bold"), width=2)
+        synth_emerg_dot.pack(side=tk.LEFT)
+        tk.Label(emerg_row, text="⚠ child alone", bg="#0d0d0d", fg="#884400",
+                 font=("Courier New", 8, "bold"), width=16, anchor="w").pack(side=tk.LEFT)
+        synth_emerg_val = tk.Label(emerg_row, text="clear", bg="#0d0d0d", fg="#444444",
+                                   font=("Courier New", 8), anchor="w")
+        synth_emerg_val.pack(side=tk.LEFT)
 
 # CAMERA group — distance sensor (populated by detection events)
 tk.Label(ha_list, text="CAMERA", bg="#0d0d0d", fg="#333333",
