@@ -85,6 +85,15 @@ buffer_lock  = threading.Lock()
 # --- Area exclusion mask: list of (x1, y1, x2, y2) in native frame pixels ---
 mask_rects = []
 
+# --- Distance reference zone: single (x1,y1,x2,y2) in native pixels.
+#     If the motion bbox fits entirely inside this zone → "far from house".
+#     Does NOT paint black — only used for distance classification. ---
+far_zone = None
+
+# Placeholder refs for the distance sensor labels in the HA panel (set during UI build)
+distance_dot_lbl = None
+distance_val_lbl = None
+
 # ---------------------------------------------------------------
 # HOME ASSISTANT CONFIG
 # ---------------------------------------------------------------
@@ -274,6 +283,38 @@ def jpeg_apply_mask(jpeg_bytes):
     img = apply_mask(img)
     _, enc = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 92])
     return enc.tobytes()
+
+# ---------------------------------------------------------------
+# DISTANCE DETECTION
+# ---------------------------------------------------------------
+def compute_distance(bbox):
+    """
+    Returns:
+      "more than 15 feet from house"  — bbox is entirely inside far_zone
+      "closer than 15 feet to house"  — bbox exists but extends outside far_zone
+      None                            — far_zone not configured or no bbox
+    """
+    if far_zone is None or bbox is None:
+        return None
+    x1, y1, x2, y2 = bbox
+    fx1, fy1, fx2, fy2 = far_zone
+    if x1 >= fx1 and y1 >= fy1 and x2 <= fx2 and y2 <= fy2:
+        return "more than 15 feet from house"
+    return "closer than 15 feet to house"
+
+def _update_distance_display(distance):
+    """Update the distance sensor row in the HA panel (must run on main thread)."""
+    if distance_dot_lbl is None:
+        return
+    is_close = "closer" in distance
+    distance_dot_lbl.config(
+        text="●" if is_close else "○",
+        fg="#ff8800" if is_close else "#00ff88"
+    )
+    distance_val_lbl.config(
+        text="close  <15ft" if is_close else "far  >15ft",
+        fg="#ff8800" if is_close else "#00ff88"
+    )
 
 # ---------------------------------------------------------------
 # MOTION DETECTION & BOUNDING BOX
@@ -593,6 +634,11 @@ def queue_worker():
             crop_b64 = base64.b64encode(cropped_bytes).decode()
             root.after(0, lambda b=crop_b64: show_detected_image(b))
 
+            # --- Distance classification ---
+            distance = compute_distance(bbox)
+            if distance:
+                root.after(0, lambda d=distance: _update_distance_display(d))
+
             # --- Stage 1: Vision model ---
             qsize = analysis_queue.qsize()
             root.after(0, lambda q=qsize, t=ts_str: status_var.set(
@@ -603,10 +649,11 @@ def queue_worker():
             # --- Stage 2: Text model with full context ---
             root.after(0, lambda t=ts_str: status_var.set(f"🧠 Judgment [{t}]"))
             chicago_now = datetime.now(CHICAGO_TZ).strftime("%A %B %d %Y  %I:%M:%S %p %Z")
+            distance_line = f"\nDistance from house: {distance}" if distance else ""
             full_text_prompt = (
                 f"{text_prompt}\n\n"
                 f"Time: {chicago_now}\n\n"
-                f"Home state:\n{build_ha_context()}\n\n"
+                f"Home state:\n{build_ha_context()}{distance_line}\n\n"
                 f"Visual observation:\n{vision_result}"
             )
             text_result = analyze_text(full_text_prompt, text_model)
@@ -830,7 +877,7 @@ def run_flask():
 # AREA RESTRICTOR WIZARD
 # ---------------------------------------------------------------
 def open_mask_wizard():
-    global mask_rects
+    global mask_rects, far_zone
 
     # Grab the most recent frame from the buffer
     with buffer_lock:
@@ -845,59 +892,68 @@ def open_mask_wizard():
         return
     native_h, native_w = native.shape[:2]
 
-    # Display size
     disp_w, disp_h = 960, 540
     scale_x = native_w / disp_w
     scale_y = native_h / disp_h
 
     win = tk.Toplevel(root)
-    win.title("Area Restrictor — draw boxes to exclude, right-click to delete")
+    win.title("Zone Editor — MASK (black exclusion) | FAR ZONE (15+ ft distance reference)")
     win.configure(bg="#0a0a0a")
     win.resizable(False, False)
 
-    # Convert frame to PIL for display
     rgb = cv2.cvtColor(native, cv2.COLOR_BGR2RGB)
     pil_bg = Image.fromarray(rgb).resize((disp_w, disp_h), Image.LANCZOS)
 
-    # We'll redraw the canvas whenever rects change
     canvas = tk.Canvas(win, width=disp_w, height=disp_h,
-                       bg="#111111", cursor="crosshair",
-                       highlightthickness=0)
+                       bg="#111111", cursor="crosshair", highlightthickness=0)
     canvas.pack(padx=10, pady=(10, 4))
 
-    # Header info
-    info_var = tk.StringVar(value=f"{len(mask_rects)} zone(s) active — drag to add, right-click to delete")
+    info_var = tk.StringVar()
     tk.Label(win, textvariable=info_var, bg="#0a0a0a", fg="#555555",
              font=("Courier New", 8)).pack()
 
-    # Button row
     btn_row = tk.Frame(win, bg="#0a0a0a")
     btn_row.pack(fill=tk.X, padx=10, pady=(4, 10))
 
+    # Current drawing mode: "mask" or "far"
+    _mode = {"v": "mask"}
+
+    def _info_text():
+        fz = "SET" if far_zone else "not set"
+        return (f"{len(mask_rects)} mask zone(s)   |   far zone: {fz}"
+                f"   |   mode: {'MASK ZONE' if _mode['v'] == 'mask' else '15+ FT ZONE'}"
+                f"   |   right-click to delete")
+
     def redraw():
         canvas.delete("all")
-        # Draw background frame
         tk_img = ImageTk.PhotoImage(pil_bg)
         canvas.create_image(0, 0, anchor="nw", image=tk_img)
-        canvas._bg_ref = tk_img  # keep reference
+        canvas._bg_ref = tk_img
 
-        # Draw saved rects
+        # Mask zones — black fill, red outline
         for i, (x1, y1, x2, y2) in enumerate(mask_rects):
-            dx1 = int(x1 / scale_x)
-            dy1 = int(y1 / scale_y)
-            dx2 = int(x2 / scale_x)
-            dy2 = int(y2 / scale_y)
+            dx1, dy1 = int(x1 / scale_x), int(y1 / scale_y)
+            dx2, dy2 = int(x2 / scale_x), int(y2 / scale_y)
             canvas.create_rectangle(dx1, dy1, dx2, dy2,
-                                    fill="black", outline="#ff4444", width=2,
-                                    tags=f"rect{i}")
-            # Label in corner
+                                    fill="black", outline="#ff4444", width=2)
             canvas.create_text(dx1 + 4, dy1 + 4, anchor="nw",
-                                text=str(i + 1), fill="#ff4444",
-                                font=("Courier New", 9, "bold"))
+                               text=str(i + 1), fill="#ff4444",
+                               font=("Courier New", 9, "bold"))
 
-        info_var.set(f"{len(mask_rects)} zone(s) active — drag to add, right-click to delete")
+        # Far zone — no fill, blue outline with label
+        if far_zone:
+            fx1, fy1, fx2, fy2 = far_zone
+            dx1, dy1 = int(fx1 / scale_x), int(fy1 / scale_y)
+            dx2, dy2 = int(fx2 / scale_x), int(fy2 / scale_y)
+            canvas.create_rectangle(dx1, dy1, dx2, dy2,
+                                    fill="", outline="#4488ff", width=3,
+                                    dash=(8, 4))
+            canvas.create_text(dx1 + 6, dy1 + 6, anchor="nw",
+                               text="15+ ft zone", fill="#4488ff",
+                               font=("Courier New", 9, "bold"))
 
-    # Drawing state
+        info_var.set(_info_text())
+
     _draw = {"start": None, "live_rect": None}
 
     def on_press(e):
@@ -912,10 +968,14 @@ def open_mask_wizard():
         x0, y0 = _draw["start"]
         if _draw["live_rect"]:
             canvas.delete(_draw["live_rect"])
-        _draw["live_rect"] = canvas.create_rectangle(
-            x0, y0, e.x, e.y,
-            fill="black", outline="#ffaa00", width=2, stipple="gray50"
-        )
+        if _mode["v"] == "mask":
+            _draw["live_rect"] = canvas.create_rectangle(
+                x0, y0, e.x, e.y,
+                fill="black", outline="#ffaa00", width=2, stipple="gray50")
+        else:
+            _draw["live_rect"] = canvas.create_rectangle(
+                x0, y0, e.x, e.y,
+                fill="", outline="#4488ff", width=3, dash=(8, 4))
 
     def on_release(e):
         if _draw["start"] is None:
@@ -928,44 +988,81 @@ def open_mask_wizard():
             canvas.delete(_draw["live_rect"])
             _draw["live_rect"] = None
         if abs(x2_d - x1_d) < 5 or abs(y2_d - y1_d) < 5:
-            return  # too small, ignore
-        # Scale back to native resolution
+            return
         nx1 = max(0, int(x1_d * scale_x))
         ny1 = max(0, int(y1_d * scale_y))
         nx2 = min(native_w, int(x2_d * scale_x))
         ny2 = min(native_h, int(y2_d * scale_y))
-        mask_rects.append((nx1, ny1, nx2, ny2))
+        if _mode["v"] == "mask":
+            mask_rects.append((nx1, ny1, nx2, ny2))
+        else:
+            globals()["far_zone"] = (nx1, ny1, nx2, ny2)
         redraw()
         schedule_save()
 
     def on_right_click(e):
-        # Find and delete the rect clicked on
+        # Check far zone first
+        if far_zone:
+            fx1, fy1, fx2, fy2 = far_zone
+            dx1, dy1 = int(fx1 / scale_x), int(fy1 / scale_y)
+            dx2, dy2 = int(fx2 / scale_x), int(fy2 / scale_y)
+            if dx1 <= e.x <= dx2 and dy1 <= e.y <= dy2:
+                globals()["far_zone"] = None
+                redraw()
+                schedule_save()
+                return
+        # Check mask zones
         for i, (x1, y1, x2, y2) in enumerate(mask_rects):
-            dx1 = int(x1 / scale_x)
-            dy1 = int(y1 / scale_y)
-            dx2 = int(x2 / scale_x)
-            dy2 = int(y2 / scale_y)
+            dx1, dy1 = int(x1 / scale_x), int(y1 / scale_y)
+            dx2, dy2 = int(x2 / scale_x), int(y2 / scale_y)
             if dx1 <= e.x <= dx2 and dy1 <= e.y <= dy2:
                 mask_rects.pop(i)
                 redraw()
                 schedule_save()
                 return
 
-    def clear_all():
+    def clear_masks():
         mask_rects.clear()
         redraw()
         schedule_save()
+
+    def clear_far():
+        globals()["far_zone"] = None
+        redraw()
+        schedule_save()
+
+    def toggle_mode():
+        _mode["v"] = "far" if _mode["v"] == "mask" else "mask"
+        if _mode["v"] == "mask":
+            mode_btn.config(text="MODE: MASK ZONE", fg="#ff4444",
+                            activeforeground="#ff4444", activebackground="#2a0000")
+        else:
+            mode_btn.config(text="MODE: 15+ FT ZONE", fg="#4488ff",
+                            activeforeground="#4488ff", activebackground="#00112a")
+        info_var.set(_info_text())
 
     canvas.bind("<ButtonPress-1>",   on_press)
     canvas.bind("<B1-Motion>",       on_drag)
     canvas.bind("<ButtonRelease-1>", on_release)
     canvas.bind("<Button-3>",        on_right_click)
 
-    tk.Button(btn_row, text="🗑  CLEAR ALL", command=clear_all,
+    mode_btn = tk.Button(btn_row, text="MODE: MASK ZONE", command=toggle_mode,
+              bg="#111111", fg="#ff4444", font=("Courier New", 9, "bold"),
+              relief=tk.FLAT, padx=10, pady=6, cursor="hand2",
+              activebackground="#2a0000", activeforeground="#ff4444", bd=0)
+    mode_btn.pack(side=tk.LEFT)
+
+    tk.Button(btn_row, text="🗑  CLEAR MASKS", command=clear_masks,
               bg="#111111", fg="#ff4444", font=("Courier New", 9, "bold"),
               relief=tk.FLAT, padx=10, pady=6, cursor="hand2",
               activebackground="#2a0000", activeforeground="#ff4444", bd=0
-              ).pack(side=tk.LEFT)
+              ).pack(side=tk.LEFT, padx=(6, 0))
+
+    tk.Button(btn_row, text="✕  CLEAR FAR ZONE", command=clear_far,
+              bg="#111111", fg="#4488ff", font=("Courier New", 9, "bold"),
+              relief=tk.FLAT, padx=10, pady=6, cursor="hand2",
+              activebackground="#00112a", activeforeground="#4488ff", bd=0
+              ).pack(side=tk.LEFT, padx=(6, 0))
 
     tk.Button(btn_row, text="✓  DONE", command=win.destroy,
               bg="#111111", fg="#00ff88", font=("Courier New", 9, "bold"),
@@ -1018,6 +1115,7 @@ def save_config(*_):
             "cam_name":        cam_name_var.get(),
             "system_active":   system_active_var.get(),
             "mask_rects":      [list(r) for r in mask_rects],
+            "far_zone":        list(far_zone) if far_zone else None,
         }
         CONFIG_PATH.write_text(json.dumps(data, indent=2))
     except Exception as e:
@@ -1063,6 +1161,8 @@ def load_config():
         if "mask_rects" in data:
             mask_rects.clear()
             mask_rects.extend(tuple(r) for r in data["mask_rects"])
+        if "far_zone" in data and data["far_zone"]:
+            globals()["far_zone"] = tuple(data["far_zone"])
         print(f"[Config] Loaded from {CONFIG_PATH}")
     except Exception as e:
         print(f"[Config] Load error: {e}")
@@ -1390,6 +1490,24 @@ for group_name, entities in HA_GROUPS:
                            font=("Courier New", 8), anchor="w")
         val_lbl.pack(side=tk.LEFT)
         ha_row_labels[eid] = {"dot": dot_lbl, "val": val_lbl}
+
+# CAMERA group — distance sensor (populated by detection events)
+tk.Label(ha_list, text="CAMERA", bg="#0d0d0d", fg="#333333",
+         font=("Courier New", 7, "bold"), padx=12,
+         anchor="w").pack(fill=tk.X, pady=(8, 2))
+dist_row = tk.Frame(ha_list, bg="#0d0d0d")
+dist_row.pack(fill=tk.X, padx=12, pady=1)
+_ddot = tk.Label(dist_row, text="○", bg="#0d0d0d", fg="#444444",
+                 font=("Courier New", 10, "bold"), width=2)
+_ddot.pack(side=tk.LEFT)
+tk.Label(dist_row, text="distance", bg="#0d0d0d", fg="#555555",
+         font=("Courier New", 8), width=16, anchor="w").pack(side=tk.LEFT)
+_dval = tk.Label(dist_row, text="—", bg="#0d0d0d", fg="#444444",
+                 font=("Courier New", 8), anchor="w")
+_dval.pack(side=tk.LEFT)
+# Wire up to the module-level refs used by _update_distance_display
+distance_dot_lbl = _ddot
+distance_val_lbl  = _dval
 
 ha_list.update_idletasks()
 ha_canvas.configure(scrollregion=ha_canvas.bbox("all"))
