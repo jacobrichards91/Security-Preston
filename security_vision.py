@@ -95,6 +95,12 @@ far_zone = None
 distance_dot_lbl = None
 distance_val_lbl = None
 
+# Model metadata fetched from Ollama at startup: {name: {param_size, size_gb, quantization}}
+_model_info = {}
+# UI label refs for per-model info display (set during UI build)
+vision_model_info_lbl = None
+text_model_info_lbl   = None
+
 # ---------------------------------------------------------------
 # SYNTHETIC SENSORS  (derived from vision model output)
 # ---------------------------------------------------------------
@@ -603,26 +609,76 @@ def save_event_background(frame_a, frame_b, cropped, description, bbox, ts):
 # ---------------------------------------------------------------
 # OLLAMA
 # ---------------------------------------------------------------
+def _fmt_size(gb):
+    """Format GB value as human-readable string."""
+    if gb >= 1.0:
+        return f"{gb:.1f} GB"
+    return f"{gb * 1024:.0f} MB"
+
+def _update_model_info_labels(*_):
+    """Refresh the per-model info labels in the Master tab after a selection change."""
+    for var, lbl in [(vision_model_var, vision_model_info_lbl),
+                     (text_model_var,   text_model_info_lbl)]:
+        if lbl is None:
+            continue
+        info = _model_info.get(var.get(), {})
+        if info:
+            parts = []
+            if info.get("param_size"):
+                parts.append(info["param_size"])
+            if info.get("size_gb", 0) > 0:
+                parts.append(_fmt_size(info["size_gb"]))
+            if info.get("quantization"):
+                parts.append(info["quantization"])
+            if info.get("family"):
+                parts.append(info["family"])
+            lbl.config(text="  ·  ".join(parts) if parts else "—")
+        else:
+            lbl.config(text="—")
+
 def fetch_models():
+    global _model_info
     try:
         resp = requests.get("http://localhost:11434/api/tags", timeout=10)
         resp.raise_for_status()
-        models = [m["name"] for m in resp.json().get("models", [])]
-        if models:
-            vision_model_dropdown["values"] = models
-            text_model_dropdown["values"]   = models
-            # Default vision model to minicpm-v
-            if "minicpm-v:latest" in models:
-                vision_model_var.set("minicpm-v:latest")
-            elif any("minicpm-v" in m for m in models):
-                vision_model_var.set(next(m for m in models if "minicpm-v" in m))
-            else:
-                vision_model_var.set(models[0])
-            # Default text model — keep whatever is loaded, fall back to first
-            if text_model_var.get() not in models:
-                text_model_var.set(models[0])
+        raw = resp.json().get("models", [])
+
+        # Parse full metadata
+        _model_info.clear()
+        for m in raw:
+            name    = m.get("name", "")
+            details = m.get("details", {})
+            _model_info[name] = {
+                "param_size":   details.get("parameter_size", ""),
+                "quantization": details.get("quantization_level", ""),
+                "size_gb":      m.get("size", 0) / (1024 ** 3),
+                "family":       details.get("family", ""),
+            }
+
+        model_names = list(_model_info.keys())
+        print(f"[Models] {len(model_names)} available:")
+        for n in model_names:
+            i = _model_info[n]
+            print(f"  {n:<40}  {i['param_size']:<6}  {_fmt_size(i['size_gb']):<10}  {i['quantization']}")
+
+        if model_names:
+            vision_model_dropdown["values"] = model_names
+            text_model_dropdown["values"]   = model_names
+            # Default vision model to minicpm-v if present, else keep current or use first
+            if vision_model_var.get() not in model_names:
+                if "minicpm-v:latest" in model_names:
+                    vision_model_var.set("minicpm-v:latest")
+                elif any("minicpm-v" in m for m in model_names):
+                    vision_model_var.set(next(m for m in model_names if "minicpm-v" in m))
+                else:
+                    vision_model_var.set(model_names[0])
+            if text_model_var.get() not in model_names:
+                text_model_var.set(model_names[0])
+
+            root.after(0, _update_model_info_labels)
+
     except Exception as e:
-        status_var.set(f"⚠️ Could not fetch models: {e}")
+        root.after(0, lambda: status_var.set(f"⚠️ Could not fetch models: {e}"))
 
 def warmup_model():
     status_var.set("⏳ Loading models...")
@@ -1511,8 +1567,11 @@ tk.Label(vision_col, text="VISION MODEL", bg="#0a0a0a", fg="#444444",
          font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 4))
 vision_model_dropdown = ttk.Combobox(vision_col, textvariable=vision_model_var,
                                       font=("Courier New", 10), style="Dark.TCombobox",
-                                      state="readonly", width=20)
-vision_model_dropdown.pack(anchor="w", pady=(0, 4))
+                                      state="readonly", width=28)
+vision_model_dropdown.pack(anchor="w", pady=(0, 2))
+vision_model_info_lbl = tk.Label(vision_col, text="—", bg="#0a0a0a", fg="#333333",
+                                  font=("Courier New", 7), anchor="w")
+vision_model_info_lbl.pack(anchor="w", pady=(0, 8))
 
 text_col = tk.Frame(model_row, bg="#0a0a0a")
 text_col.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -1520,8 +1579,15 @@ tk.Label(text_col, text="TEXT MODEL", bg="#0a0a0a", fg="#444444",
          font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 4))
 text_model_dropdown = ttk.Combobox(text_col, textvariable=text_model_var,
                                     font=("Courier New", 10), style="Dark.TCombobox",
-                                    state="readonly", width=20)
-text_model_dropdown.pack(anchor="w", pady=(0, 4))
+                                    state="readonly", width=28)
+text_model_dropdown.pack(anchor="w", pady=(0, 2))
+text_model_info_lbl = tk.Label(text_col, text="—", bg="#0a0a0a", fg="#333333",
+                                font=("Courier New", 7), anchor="w")
+text_model_info_lbl.pack(anchor="w", pady=(0, 8))
+
+# Refresh info labels whenever selection changes
+vision_model_var.trace_add("write", _update_model_info_labels)
+text_model_var.trace_add("write",   _update_model_info_labels)
 
 tk.Label(master_left, text=f"💾  {SAVE_DIR}", bg="#0a0a0a", fg="#333333",
          font=("Courier New", 8)).pack(anchor="w", pady=(0, 12))
