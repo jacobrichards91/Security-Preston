@@ -14,7 +14,7 @@ import numpy as np
 import cv2
 from PIL import Image, ImageTk, ImageDraw
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask, request
 import logging
@@ -23,7 +23,14 @@ import logging
 OLLAMA_URL = "http://localhost:11434/api/generate"
 DEFAULT_VISION_MODEL = "minicpm-v:latest"
 DEFAULT_TEXT_MODEL   = "minicpm-v:latest"
-CHICAGO_TZ = ZoneInfo("America/Chicago")
+
+# On Windows, zoneinfo needs the tzdata package: pip install tzdata
+try:
+    CHICAGO_TZ = ZoneInfo("America/Chicago")
+except Exception:
+    print("[Warning] tzdata not installed — run: pip install tzdata")
+    print("[Warning] Falling back to UTC-5 (CDT). Install tzdata for correct DST handling.")
+    CHICAGO_TZ = timezone(timedelta(hours=-5))
 WEBHOOK_PORT = 8765
 SAVE_DIR = Path(os.path.expanduser("~")) / "SecurityEvents"
 SAVE_DIR.mkdir(exist_ok=True)
