@@ -23,7 +23,8 @@ DEFAULT_MODEL = "minicpm-v:latest"
 WEBHOOK_PORT = 8765
 SAVE_DIR = Path(os.path.expanduser("~")) / "SecurityEvents"
 SAVE_DIR.mkdir(exist_ok=True)
-CONFIG_PATH = Path(__file__).parent / "config.json"
+CONFIG_PATH = Path.home() / "Documents" / "GitHub" / "security_preston_config.json"
+CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 RTSP_URL = "rtsp://192.168.0.166:7447/YD4arutidcyKjQvI"
 STREAM_PREVIEW_INTERVAL = 3000  # ms between live preview refreshes
@@ -33,6 +34,10 @@ BUFFER_SECONDS = 3.0          # how many seconds of frames to keep
 FRAME_INTERVAL = 0.2          # grab a frame every N seconds for buffer (not tunable)
 SNAP_BEFORE_SECS = 2.5        # frame A: this many seconds before the trigger
 SNAP_AFTER_SECS  = 2.0        # frame B: this many seconds before the trigger (closer)
+MIN_BOX_PCT = 0.05            # minimum contour size as % of frame area
+
+system_active = threading.Event()
+system_active.set()           # ON by default
 CROP_PADDING = 50             # px padding around bounding box (default, overridden by UI var)
 
 DEBUG_MODE = True             # show debug windows
@@ -194,7 +199,7 @@ def compute_motion_crop(frame_a_bytes, frame_b_bytes):
     contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     # Filter small noise contours (< 0.05% of frame area)
-    min_area = w * h * 0.0005
+    min_area = w * h * (min_box_pct_var.get() / 100.0)
     contours = [c for c in contours if cv2.contourArea(c) > min_area]
 
     bbox = None
@@ -513,6 +518,9 @@ flask_app = Flask(__name__)
 
 @flask_app.route("/event", methods=["POST"])
 def event():
+    if not system_active.is_set():
+        print("[Webhook] System is OFF — ignoring event")
+        return "INACTIVE", 200
     try:
         raw = request.get_data(as_text=True)
         data = request.get_json(force=True) or {}
@@ -723,16 +731,19 @@ def snap_from_stream():
 _save_job = None
 
 def save_config(*_):
-    """Write all tunable settings to config.json next to the script."""
+    """Write all tunable settings to config.json."""
     try:
         data = {
-            "model":        model_var.get(),
-            "prompt":       prompt_text.get("1.0", tk.END).rstrip("\n"),
-            "snap_before":  snap_before_var.get(),
-            "snap_after":   snap_after_var.get(),
-            "buffer_secs":  buffer_secs_var.get(),
-            "crop_padding": crop_padding_var.get(),
-            "mask_rects":   [list(r) for r in mask_rects],
+            "model":           model_var.get(),
+            "prompt":          prompt_text.get("1.0", tk.END).rstrip("\n"),
+            "snap_before":     snap_before_var.get(),
+            "snap_after":      snap_after_var.get(),
+            "buffer_secs":     buffer_secs_var.get(),
+            "crop_padding":    crop_padding_var.get(),
+            "min_box_pct":     min_box_pct_var.get(),
+            "cam_name":        cam_name_var.get(),
+            "system_active":   system_active_var.get(),
+            "mask_rects":      [list(r) for r in mask_rects],
         }
         CONFIG_PATH.write_text(json.dumps(data, indent=2))
     except Exception as e:
@@ -764,6 +775,12 @@ def load_config():
             buffer_secs_var.set(data["buffer_secs"])
         if "crop_padding" in data:
             crop_padding_var.set(data["crop_padding"])
+        if "min_box_pct" in data:
+            min_box_pct_var.set(data["min_box_pct"])
+        if "cam_name" in data:
+            cam_name_var.set(data["cam_name"])
+        if "system_active" in data:
+            system_active_var.set(data["system_active"])
         if "mask_rects" in data:
             mask_rects.clear()
             mask_rects.extend(tuple(r) for r in data["mask_rects"])
@@ -780,55 +797,68 @@ root.geometry("1100x860")
 root.configure(bg="#0a0a0a")
 root.resizable(True, True)
 
-# --- Tunable timing vars (all relative to webhook trigger, seconds back in time) ---
+# --- All tunable vars ---
 snap_before_var   = tk.DoubleVar(value=SNAP_BEFORE_SECS)
 snap_after_var    = tk.DoubleVar(value=SNAP_AFTER_SECS)
 buffer_secs_var   = tk.DoubleVar(value=BUFFER_SECONDS)
 crop_padding_var  = tk.IntVar(value=CROP_PADDING)
+min_box_pct_var   = tk.DoubleVar(value=MIN_BOX_PCT)
+model_var         = tk.StringVar(value=DEFAULT_MODEL)
+cam_name_var      = tk.StringVar(value="Front Door")
+system_active_var = tk.BooleanVar(value=True)
 
-for _v in (snap_before_var, snap_after_var, buffer_secs_var, crop_padding_var):
+for _v in (snap_before_var, snap_after_var, buffer_secs_var,
+           crop_padding_var, min_box_pct_var, model_var):
     _v.trace_add("write", schedule_save)
 
-# Status bar
+# --- Status bar and debug (outside tabs, always visible) ---
 status_var = tk.StringVar(value="Starting...")
 tk.Label(root, textvariable=status_var, bg="#0a0a0a", fg="#444444",
          font=("Courier New", 9), anchor="w", padx=12, pady=4).pack(fill=tk.X, side=tk.BOTTOM)
-
-# Debug indicator
 if DEBUG_MODE:
     tk.Label(root, text="● DEBUG MODE ON", bg="#0a0a0a", fg="#ff6600",
              font=("Courier New", 9, "bold"), anchor="e", padx=12).pack(fill=tk.X, side=tk.BOTTOM)
 
-# Top: model
-top_bar = tk.Frame(root, bg="#0a0a0a")
-top_bar.pack(fill=tk.X, padx=14, pady=(14, 4))
-
-tk.Label(top_bar, text="MODEL", bg="#0a0a0a", fg="#444444",
-         font=("Courier New", 9, "bold")).pack(side=tk.LEFT, padx=(0, 8))
-
-model_var = tk.StringVar(value=DEFAULT_MODEL)
+# --- Notebook (tabs) ---
 style = ttk.Style()
 style.theme_use("clam")
+style.configure("Dark.TNotebook",
+    background="#0a0a0a", borderwidth=0, tabmargins=[0, 0, 0, 0])
+style.configure("Dark.TNotebook.Tab",
+    background="#111111", foreground="#555555",
+    padding=[16, 6], font=("Courier New", 10, "bold"),
+    borderwidth=0)
+style.map("Dark.TNotebook.Tab",
+    background=[("selected", "#0a0a0a")],
+    foreground=[("selected", "#00ff88")])
 style.configure("Dark.TCombobox",
     fieldbackground="#111111", background="#111111",
     foreground="#00ff88", arrowcolor="#00ff88",
     selectbackground="#003322", selectforeground="#00ff88",
-    bordercolor="#222222", lightcolor="#111111", darkcolor="#111111"
-)
-model_dropdown = ttk.Combobox(top_bar, textvariable=model_var,
-                               font=("Courier New", 10), style="Dark.TCombobox",
-                               state="readonly", width=28)
-model_dropdown.pack(side=tk.LEFT)
-model_var.trace_add("write", schedule_save)
+    bordercolor="#222222", lightcolor="#111111", darkcolor="#111111")
 
-tk.Label(top_bar, text=f"💾 {SAVE_DIR}", bg="#0a0a0a", fg="#333333",
-         font=("Courier New", 8), padx=12).pack(side=tk.LEFT)
+notebook = ttk.Notebook(root, style="Dark.TNotebook")
+notebook.pack(fill=tk.BOTH, expand=True)
 
-# Two-panel: live stream | last detected
-panels = tk.Frame(root, bg="#0a0a0a")
-panels.pack(fill=tk.X, padx=14, pady=(8, 4))
+tab_camera = tk.Frame(notebook, bg="#0a0a0a")
+tab_master  = tk.Frame(notebook, bg="#0a0a0a")
+notebook.add(tab_camera, text="Front Door")
+notebook.add(tab_master,  text="Master")
 
-# Stream panel
+# ── update tab label when cam_name_var changes ──
+def _on_cam_name(*_):
+    notebook.tab(tab_camera, text=cam_name_var.get() or "Camera")
+    schedule_save()
+cam_name_var.trace_add("write", _on_cam_name)
+
+# ═══════════════════════════════════════════════
+# TAB 1 — CAMERA (Front Door)
+# ═══════════════════════════════════════════════
+
+# Live stream + detected panels
+panels = tk.Frame(tab_camera, bg="#0a0a0a")
+panels.pack(fill=tk.X, padx=14, pady=(12, 4))
+
 stream_panel = tk.Frame(panels, bg="#0a0a0a")
 stream_panel.pack(side=tk.LEFT, padx=(0, 8))
 
@@ -845,115 +875,135 @@ stream_label = tk.Label(stream_panel, bg="#0d1a0d", text="Connecting to stream..
                          anchor="center", relief=tk.FLAT)
 stream_label.pack()
 
-# Detected panel
 detected_panel = tk.Frame(panels, bg="#0a0a0a")
 detected_panel.pack(side=tk.LEFT)
-
 tk.Label(detected_panel, text="LAST DETECTED (AI CROP)", bg="#0a0a0a", fg="#333333",
          font=("Courier New", 8, "bold")).pack(anchor="w")
-
 detected_label = tk.Label(detected_panel, bg="#111111", text="Waiting for event...",
                             fg="#333333", font=("Courier New", 9),
                             anchor="center", relief=tk.FLAT)
 detected_label.pack()
 
 # Output
-tk.Label(root, text="OUTPUT", bg="#0a0a0a", fg="#333333",
-         font=("Courier New", 8, "bold"), anchor="w", padx=14).pack(fill=tk.X, pady=(6,0))
-
-out_frame = tk.Frame(root, bg="#0a0a0a")
+tk.Label(tab_camera, text="OUTPUT", bg="#0a0a0a", fg="#333333",
+         font=("Courier New", 8, "bold"), anchor="w", padx=14).pack(fill=tk.X, pady=(6, 0))
+out_frame = tk.Frame(tab_camera, bg="#0a0a0a")
 out_frame.pack(fill=tk.BOTH, expand=True, padx=14)
-
 output_text = tk.Text(out_frame, bg="#111111", fg="#e0e0e0",
     font=("Courier New", 11), relief=tk.FLAT,
     padx=10, pady=8, wrap=tk.WORD, height=6,
-    state=tk.DISABLED, insertbackground="#00ff88",
-    selectbackground="#003322")
+    state=tk.DISABLED, insertbackground="#00ff88", selectbackground="#003322")
 out_scroll = tk.Scrollbar(out_frame, command=output_text.yview, bg="#111111")
 output_text.configure(yscrollcommand=out_scroll.set)
 out_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 output_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
 # Action row
-action_row = tk.Frame(root, bg="#0a0a0a")
+action_row = tk.Frame(tab_camera, bg="#0a0a0a")
 action_row.pack(fill=tk.X, padx=14, pady=(6, 4))
-
-browse_btn = tk.Button(
-    action_row, text="📁  BROWSE", command=browse_and_analyze,
-    bg="#111111", fg="#00ff88", font=("Courier New", 10, "bold"),
-    relief=tk.FLAT, padx=12, pady=10, cursor="hand2",
-    activebackground="#003322", activeforeground="#00ff88", bd=0
-)
-browse_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-snap_btn = tk.Button(
-    action_row, text="📡  TRIGGER TEST", command=snap_from_stream,
-    bg="#111111", fg="#00aaff", font=("Courier New", 10, "bold"),
-    relief=tk.FLAT, padx=12, pady=10, cursor="hand2",
-    activebackground="#001a33", activeforeground="#00aaff", bd=0
-)
-snap_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
-
-mask_btn = tk.Button(
-    action_row, text="⬛  MASK ZONES", command=open_mask_wizard,
-    bg="#111111", fg="#ff8800", font=("Courier New", 10, "bold"),
-    relief=tk.FLAT, padx=12, pady=10, cursor="hand2",
-    activebackground="#2a1800", activeforeground="#ff8800", bd=0
-)
-mask_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
-
+tk.Button(action_row, text="📁  BROWSE", command=browse_and_analyze,
+          bg="#111111", fg="#00ff88", font=("Courier New", 10, "bold"),
+          relief=tk.FLAT, padx=12, pady=10, cursor="hand2",
+          activebackground="#003322", activeforeground="#00ff88", bd=0
+          ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+tk.Button(action_row, text="📡  TRIGGER TEST", command=snap_from_stream,
+          bg="#111111", fg="#00aaff", font=("Courier New", 10, "bold"),
+          relief=tk.FLAT, padx=12, pady=10, cursor="hand2",
+          activebackground="#001a33", activeforeground="#00aaff", bd=0
+          ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+tk.Button(action_row, text="⬛  MASK ZONES", command=open_mask_wizard,
+          bg="#111111", fg="#ff8800", font=("Courier New", 10, "bold"),
+          relief=tk.FLAT, padx=12, pady=10, cursor="hand2",
+          activebackground="#2a1800", activeforeground="#ff8800", bd=0
+          ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
 timer_var = tk.StringVar(value="⏱  —")
 tk.Label(action_row, textvariable=timer_var, bg="#0a0a0a", fg="#00aaff",
          font=("Courier New", 12, "bold"), padx=14).pack(side=tk.RIGHT)
 
-# Timing config
-timing_frame = tk.Frame(root, bg="#0a0a0a")
-timing_frame.pack(fill=tk.X, padx=14, pady=(4, 2))
-
-tk.Label(timing_frame, text="TIMING", bg="#0a0a0a", fg="#444444",
-         font=("Courier New", 8, "bold")).pack(side=tk.LEFT, padx=(0, 14))
-
-def _timing_spin(parent, label, var, from_, to, increment):
+# Timing / settings row
+def _timing_spin(parent, label, var, from_, to, increment, unit="s"):
     f = tk.Frame(parent, bg="#0a0a0a")
     f.pack(side=tk.LEFT, padx=(0, 14))
     tk.Label(f, text=label, bg="#0a0a0a", fg="#555555",
              font=("Courier New", 8)).pack(side=tk.LEFT)
-    sb = tk.Spinbox(f, textvariable=var, from_=from_, to=to, increment=increment,
-                    format="%.1f", width=5,
-                    bg="#111111", fg="#00ff88", buttonbackground="#1a1a1a",
-                    relief=tk.FLAT, font=("Courier New", 9),
-                    insertbackground="#00ff88", highlightthickness=0)
-    sb.pack(side=tk.LEFT, padx=(4, 0))
-    tk.Label(f, text="s", bg="#0a0a0a", fg="#444444",
+    tk.Spinbox(f, textvariable=var, from_=from_, to=to, increment=increment,
+               format="%.2f", width=6,
+               bg="#111111", fg="#00ff88", buttonbackground="#1a1a1a",
+               relief=tk.FLAT, font=("Courier New", 9),
+               insertbackground="#00ff88", highlightthickness=0
+               ).pack(side=tk.LEFT, padx=(4, 0))
+    tk.Label(f, text=unit, bg="#0a0a0a", fg="#444444",
              font=("Courier New", 8)).pack(side=tk.LEFT, padx=(2, 0))
 
-_timing_spin(timing_frame, "buffer",  buffer_secs_var,  0.5, 30.0, 0.5)
-_timing_spin(timing_frame, "before",  snap_before_var,  0.1, 29.0, 0.1)
-_timing_spin(timing_frame, "after",   snap_after_var,   0.0, 29.0, 0.1)
+timing_frame = tk.Frame(tab_camera, bg="#0a0a0a")
+timing_frame.pack(fill=tk.X, padx=14, pady=(4, 10))
+tk.Label(timing_frame, text="SETTINGS", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(side=tk.LEFT, padx=(0, 14))
+_timing_spin(timing_frame, "buffer",   buffer_secs_var,  0.5, 30.0, 0.5)
+_timing_spin(timing_frame, "before",   snap_before_var,  0.1, 29.0, 0.1)
+_timing_spin(timing_frame, "after",    snap_after_var,   0.0, 29.0, 0.1)
+_timing_spin(timing_frame, "padding",  crop_padding_var, 0,   500,  10,  unit="px")
+_timing_spin(timing_frame, "min box",  min_box_pct_var,  0.0, 10.0, 0.01, unit="%")
 
-# Crop padding (px) — separate label since it's not a time value
-f_pad = tk.Frame(timing_frame, bg="#0a0a0a")
-f_pad.pack(side=tk.LEFT, padx=(0, 14))
-tk.Label(f_pad, text="padding", bg="#0a0a0a", fg="#555555",
-         font=("Courier New", 8)).pack(side=tk.LEFT)
-tk.Spinbox(f_pad, textvariable=crop_padding_var, from_=0, to=500, increment=10,
-           width=5, bg="#111111", fg="#00ff88", buttonbackground="#1a1a1a",
-           relief=tk.FLAT, font=("Courier New", 9),
-           insertbackground="#00ff88", highlightthickness=0).pack(side=tk.LEFT, padx=(4, 0))
-tk.Label(f_pad, text="px", bg="#0a0a0a", fg="#444444",
-         font=("Courier New", 8)).pack(side=tk.LEFT, padx=(2, 0))
+# ═══════════════════════════════════════════════
+# TAB 2 — MASTER
+# ═══════════════════════════════════════════════
+
+master_inner = tk.Frame(tab_master, bg="#0a0a0a")
+master_inner.pack(fill=tk.BOTH, expand=True, padx=24, pady=16)
+
+# System on/off toggle
+def _update_toggle(*_):
+    active = system_active_var.get()
+    if active:
+        system_active.set()
+        toggle_btn.config(text="● SYSTEM  ON", fg="#00ff88",
+                          activeforeground="#00ff88", activebackground="#003322")
+    else:
+        system_active.clear()
+        toggle_btn.config(text="○ SYSTEM  OFF", fg="#ff4444",
+                          activeforeground="#ff4444", activebackground="#2a0000")
+    schedule_save()
+
+system_active_var.trace_add("write", _update_toggle)
+
+tk.Label(master_inner, text="SYSTEM", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 4))
+toggle_btn = tk.Button(
+    master_inner, text="● SYSTEM  ON",
+    command=lambda: system_active_var.set(not system_active_var.get()),
+    bg="#111111", fg="#00ff88", font=("Courier New", 14, "bold"),
+    relief=tk.FLAT, padx=20, pady=14, cursor="hand2",
+    activebackground="#003322", activeforeground="#00ff88", bd=0, width=20)
+toggle_btn.pack(anchor="w", pady=(0, 20))
+
+# Camera name
+tk.Label(master_inner, text="CAMERA TAB NAME", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 4))
+tk.Entry(master_inner, textvariable=cam_name_var,
+         bg="#111111", fg="#00ff88", font=("Courier New", 11),
+         relief=tk.FLAT, insertbackground="#00ff88",
+         selectbackground="#003322", width=30
+         ).pack(anchor="w", pady=(0, 20))
+
+# Model
+tk.Label(master_inner, text="MODEL", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 4))
+model_dropdown = ttk.Combobox(master_inner, textvariable=model_var,
+                               font=("Courier New", 10), style="Dark.TCombobox",
+                               state="readonly", width=32)
+model_dropdown.pack(anchor="w", pady=(0, 20))
+tk.Label(master_inner, text=f"💾  {SAVE_DIR}", bg="#0a0a0a", fg="#333333",
+         font=("Courier New", 8)).pack(anchor="w", pady=(0, 20))
 
 # Prompt
-tk.Label(root, text="PROMPT", bg="#0a0a0a", fg="#333333",
-         font=("Courier New", 8, "bold"), anchor="w", padx=14).pack(fill=tk.X)
-
-prompt_frame = tk.Frame(root, bg="#0a0a0a")
-prompt_frame.pack(fill=tk.X, padx=14, pady=(2, 12))
-
+tk.Label(master_inner, text="PROMPT", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 4))
+prompt_frame = tk.Frame(master_inner, bg="#0a0a0a")
+prompt_frame.pack(fill=tk.BOTH, expand=True)
 prompt_text = tk.Text(prompt_frame, bg="#111111", fg="#999999",
-    font=("Courier New", 9), relief=tk.FLAT, padx=10, pady=6,
-    wrap=tk.WORD, height=4, insertbackground="#00ff88",
-    selectbackground="#003322")
+    font=("Courier New", 9), relief=tk.FLAT, padx=10, pady=8,
+    wrap=tk.WORD, insertbackground="#00ff88", selectbackground="#003322")
 ps = tk.Scrollbar(prompt_frame, command=prompt_text.yview, bg="#111111")
 prompt_text.configure(yscrollcommand=ps.set)
 ps.pack(side=tk.RIGHT, fill=tk.Y)
