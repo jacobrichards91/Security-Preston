@@ -370,7 +370,19 @@ class CameraTab:
     def enqueue_event(self, ts_float, ts_str, source="webhook", image_b64=None):
         app = self.app_refs
         frame_a = frame_b = None
-        if source in ("webhook", "advanced", "ha_sensor"):
+
+        if source == "ha_sensor":
+            # HA person_detected fires instantly — capture forward, not backward.
+            # Grab frame_a now, wait for the before→after gap, then grab frame_b.
+            gap = max(0.3, self.snap_before_var.get() - self.snap_after_var.get())
+            threading.Thread(
+                target=self._ha_sensor_capture,
+                args=(ts_float, ts_str, gap),
+                daemon=True,
+            ).start()
+            return
+
+        if source in ("webhook", "advanced"):
             ts_a   = ts_float - self.snap_before_var.get()
             ts_b   = ts_float - self.snap_after_var.get()
             frame_a = self.get_frame_at(ts_a)
@@ -380,6 +392,22 @@ class CameraTab:
             if frame_b and self.mask_rects:
                 frame_b = jpeg_apply_mask(frame_b, self.mask_rects)
 
+        self._enqueue_item(ts_float, ts_str, source, frame_a, frame_b, image_b64)
+
+    def _ha_sensor_capture(self, ts_float, ts_str, gap):
+        """Background thread: capture frame_a now, wait gap, capture frame_b, enqueue."""
+        frame_a = self.get_frame_at(time.time())
+        time.sleep(gap)
+        frame_b = self.get_frame_at(time.time())
+        if frame_a and self.mask_rects:
+            frame_a = jpeg_apply_mask(frame_a, self.mask_rects)
+        if frame_b and self.mask_rects:
+            frame_b = jpeg_apply_mask(frame_b, self.mask_rects)
+        self._enqueue_item(ts_float, ts_str, "ha_sensor", frame_a, frame_b, None)
+
+    def _enqueue_item(self, ts_float, ts_str, source, frame_a, frame_b, image_b64):
+        """Build the queue item and submit it."""
+        app = self.app_refs
         vpt = app.get("vision_prompt_text")
         tpt = app.get("text_prompt_text")
         item = {
@@ -393,7 +421,7 @@ class CameraTab:
             "frame_a":       frame_a,
             "frame_b":       frame_b,
             "enqueued_at":   ts_float,
-            "cam_ref":       self,   # routes results back to this tab
+            "cam_ref":       self,
         }
         if image_b64:
             item["image_b64"] = image_b64
