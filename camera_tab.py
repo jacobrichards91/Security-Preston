@@ -14,9 +14,10 @@ from datetime import datetime
 import cv2
 from PIL import Image, ImageTk
 
+from tkinter import ttk
 from constants import (
     FRAME_INTERVAL, BUFFER_SECONDS, SNAP_BEFORE_SECS, SNAP_AFTER_SECS,
-    CROP_PADDING, MIN_BOX_PCT,
+    CROP_PADDING, MIN_BOX_PCT, PERSON_DETECTED_SENSORS,
 )
 from motion import jpeg_apply_mask
 from mask_wizard import open_mask_wizard as _open_mask_wizard
@@ -56,6 +57,7 @@ class CameraTab:
         self.buffer_secs_var  = tk.DoubleVar(root, value=BUFFER_SECONDS)
         self.crop_padding_var = tk.IntVar(root,    value=CROP_PADDING)
         self.min_box_pct_var  = tk.DoubleVar(root, value=MIN_BOX_PCT)
+        self.ha_sensor_var    = tk.StringVar(root, value="")  # HA person_detected entity
 
         # ── Buffer state ──────────────────────────────────────────────────
         self.frame_buffer = collections.deque()
@@ -85,7 +87,7 @@ class CameraTab:
         # Debounce-save on any setting change (only after verification).
         for v in (self.rtsp_url_var, self.cam_name_var, self.cam_id_var,
                   self.snap_before_var, self.snap_after_var, self.buffer_secs_var,
-                  self.crop_padding_var, self.min_box_pct_var):
+                  self.crop_padding_var, self.min_box_pct_var, self.ha_sensor_var):
             v.trace_add("write", lambda *_: self._maybe_save())
 
         # Update tab label when name changes
@@ -99,6 +101,11 @@ class CameraTab:
             self.notebook.tab(self.tab_frame, text=self.cam_name_var.get() or "Camera")
         except Exception:
             pass
+
+    def _on_ha_sensor_change(self, *_):
+        display = self._ha_combo.get()
+        entity_id = self._ha_sensor_map.get(display, "")
+        self.ha_sensor_var.set(entity_id)
 
     # ── Save gate ────────────────────────────────────────────────────────
     def _maybe_save(self):
@@ -221,7 +228,19 @@ class CameraTab:
         tk.Entry(timing_frame, textvariable=self.cam_name_var, width=16,
                  bg="#111111", fg="#00ff88", insertbackground="#00ff88",
                  font=("Courier New", 9), relief=tk.FLAT, bd=2
-                 ).pack(side=tk.LEFT, padx=(0, 4))
+                 ).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Label(timing_frame, text="HA sensor", bg="#0a0a0a", fg="#444444",
+                 font=("Courier New", 8)).pack(side=tk.LEFT, padx=(0, 2))
+        _sensor_display = [label for _, label in PERSON_DETECTED_SENSORS]
+        _sensor_ids     = [eid   for eid, _ in PERSON_DETECTED_SENSORS]
+        self._ha_sensor_map = dict(zip(_sensor_display, _sensor_ids))
+        self._ha_sensor_rmap = dict(zip(_sensor_ids, _sensor_display))
+        self._ha_combo = ttk.Combobox(
+            timing_frame, values=_sensor_display, width=14,
+            font=("Courier New", 8), state="readonly")
+        self._ha_combo.set(self._ha_sensor_rmap.get(self.ha_sensor_var.get(), "— none —"))
+        self._ha_combo.pack(side=tk.LEFT, padx=(0, 4))
+        self._ha_combo.bind("<<ComboboxSelected>>", self._on_ha_sensor_change)
 
     def _spin(self, parent, label, var, from_, to, increment, unit="s"):
         f = tk.Frame(parent, bg="#0a0a0a")
@@ -351,7 +370,7 @@ class CameraTab:
     def enqueue_event(self, ts_float, ts_str, source="webhook", image_b64=None):
         app = self.app_refs
         frame_a = frame_b = None
-        if source in ("webhook", "advanced"):
+        if source in ("webhook", "advanced", "ha_sensor"):
             ts_a   = ts_float - self.snap_before_var.get()
             ts_b   = ts_float - self.snap_after_var.get()
             frame_a = self.get_frame_at(ts_a)
@@ -492,6 +511,7 @@ class CameraTab:
             "buffer_secs": self.buffer_secs_var.get(),
             "crop_padding": self.crop_padding_var.get(),
             "min_box_pct": self.min_box_pct_var.get(),
+            "ha_sensor":   self.ha_sensor_var.get(),
             "mask_rects":  [list(r) for r in self.mask_rects],
             "far_zones":   [list(z) for z in self.far_zones],
         }
@@ -505,6 +525,14 @@ class CameraTab:
         if "buffer_secs"  in data: self.buffer_secs_var.set(data["buffer_secs"])
         if "crop_padding" in data: self.crop_padding_var.set(data["crop_padding"])
         if "min_box_pct"  in data: self.min_box_pct_var.set(data["min_box_pct"])
+        if "ha_sensor" in data:
+            self.ha_sensor_var.set(data["ha_sensor"])
+            # Update combo display
+            try:
+                self._ha_combo.set(
+                    self._ha_sensor_rmap.get(data["ha_sensor"], "— none —"))
+            except Exception:
+                pass
         if "mask_rects" in data:
             self.mask_rects.clear()
             self.mask_rects.extend(tuple(r) for r in data["mask_rects"])

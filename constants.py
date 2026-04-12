@@ -154,6 +154,20 @@ LAUREN_PATTERNS = [re.compile(p, re.IGNORECASE) for p in [
 # ---------------------------------------------------------------
 # HOME ASSISTANT CONFIG
 # ---------------------------------------------------------------
+
+# Person-detected sensors — one per physical camera in Home Assistant.
+# Used to populate the HA sensor dropdown in each camera tab.
+PERSON_DETECTED_SENSORS = [
+    ("", "— none —"),
+    ("binary_sensor.front_person_detected",                "front"),
+    ("binary_sensor.front_door_person_detected",           "front door"),
+    ("binary_sensor.side_henrys_room_person_detected",     "henry's room"),
+    ("binary_sensor.side_yard_cul_de_sac_person_detected", "cul-de-sac"),
+    ("binary_sensor.side_yard_street_person_detected",     "street"),
+    ("binary_sensor.patio2_person_detected",               "patio"),
+    ("binary_sensor.backyard_person_detected",             "backyard"),
+]
+
 HA_HOST  = "192.168.0.209"
 HA_TOKEN = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
             ".eyJpc3MiOiJmMjNkMzE4Nzc1OWY0ZTQ4YTZmOWZhNTYyNjc2ZTE1ZCIsImlhdCI6MTc3NT"

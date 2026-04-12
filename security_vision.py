@@ -725,6 +725,7 @@ def _ha_is_active(state):
 
 def _ha_apply_entity(entity_id, state):
     """Update dict + UI labels for one entity (call via root.after on main thread)."""
+    old_state = ha_state.get(entity_id)
     ha_state[entity_id] = state
     if entity_id not in ha_row_labels:
         return
@@ -734,6 +735,27 @@ def _ha_apply_entity(entity_id, state):
                       fg="#00ff88" if active else "#444444")
     row["val"].config(text=state,
                       fg="#00ff88" if active else "#666666")
+
+    # Trigger analysis when a person_detected sensor transitions to active.
+    # Only fire on the transition (old != active), not on every state echo.
+    if active and not _ha_is_active(old_state or ""):
+        if "person_detected" in entity_id:
+            _trigger_from_ha_sensor(entity_id)
+
+
+def _trigger_from_ha_sensor(entity_id):
+    """Find the camera mapped to this HA sensor and enqueue analysis."""
+    if not system_active.is_set():
+        return
+    for cam in cameras:
+        if cam.ha_sensor_var.get() == entity_id:
+            ts_float = time.time()
+            ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[HA] Person detected on {entity_id} → "
+                  f"triggering {cam.cam_name_var.get()}")
+            cam.enqueue_event(ts_float, ts_str, source="ha_sensor")
+            return
+    print(f"[HA] Person detected on {entity_id} — no camera mapped")
 
 def ha_worker():
     while True:
