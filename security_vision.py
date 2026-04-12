@@ -381,7 +381,8 @@ def open_history_window():
     listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
     for entry in reversed(detection_history):   # newest first
-        listbox.insert(tk.END, f"  {entry['ts']}  [{entry['cam_name']}]")
+        secs = entry.get("elapsed", 0)
+        listbox.insert(tk.END, f"  {entry['ts']}  [{entry['cam_name']}]  {secs:.1f}s")
 
     if not detection_history:
         listbox.insert(tk.END, "  — no detections yet —")
@@ -502,6 +503,7 @@ def queue_worker():
                     "vision_result": vision_result,
                     "text_result":   text_result,
                     "image_b64":     _b,
+                    "elapsed":       time.time() - item["trigger_ts"],
                 })
                 if cam is not None:
                     root.after(0, lambda b=_b, vr=vision_result, ti=_ti, tr=text_result,
@@ -569,6 +571,7 @@ def queue_worker():
                 "vision_result": vision_result,
                 "text_result":   text_result,
                 "image_b64":     _b64,
+                "elapsed":       time.time() - item["trigger_ts"],
             })
             if cam is not None:
                 root.after(0, lambda b=_b64, vr=vision_result, ti=_ti, tr=text_result,
@@ -687,14 +690,16 @@ def event():
         alarm = data.get("alarm", {})
         triggers = alarm.get("triggers", [])
         trigger_key = triggers[0].get("key", "unknown") if triggers else "unknown"
-        print(f"[Webhook] trigger_key={trigger_key!r}")
+        # The triggering camera is in triggers[].device, NOT sources[]
+        # (sources lists every camera in the alarm group).
+        trigger_device = triggers[0].get("device", "").strip().upper() if triggers else ""
+        print(f"[Webhook] trigger_key={trigger_key!r}  trigger_device={trigger_device!r}")
 
-        # Route by camera ID — scan every camera tab's configured cam_id.
-        raw_upper = raw.upper()
+        # Route by trigger device — match against each camera tab's cam_id.
         matched = None
         for cam in cameras:
             cid = cam.cam_id_var.get().strip().upper()
-            if cid and cid in raw_upper:
+            if cid and cid == trigger_device:
                 matched = cam
                 break
 
@@ -706,10 +711,10 @@ def event():
             return "OK", 200
         else:
             configured_ids = [c.cam_id_var.get() for c in cameras]
-            print(f"[Webhook] SKIPPED — no matching camera ID found in payload "
-                  f"(configured={configured_ids!r})")
+            print(f"[Webhook] SKIPPED — trigger device {trigger_device!r} "
+                  f"not in configured IDs {configured_ids!r}")
             root.after(0, lambda: status_var.set(
-                f"Webhook received — no camera ID match"
+                f"Webhook received — no camera ID match for {trigger_device}"
             ))
             return "SKIP", 200
     except Exception as e:
