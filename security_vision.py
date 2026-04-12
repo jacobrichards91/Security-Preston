@@ -3,11 +3,13 @@ from tkinter import ttk
 import threading
 import base64
 import io
+import os
 import time
 import json
 import websocket
+from pathlib import Path
 from PIL import Image, ImageTk
-from datetime import datetime
+from datetime import datetime, date
 from flask import Flask, request
 import logging
 
@@ -40,8 +42,43 @@ _queue_stage   = ""     # "diff" | "vision" | "judgment" | ""
 cameras = []
 
 # In-memory detection history — appended by queue_worker after each completed analysis.
-# Each entry: {ts, cam_name, vision_result, text_result, image_b64}
+# Each entry: {ts, cam_name, vision_result, text_result, image_b64, elapsed}
 detection_history = []
+
+# Persist history to disk: one subfolder per day, one JSONL file per day.
+HISTORY_DIR = Path(os.path.dirname(os.path.abspath(__file__))) / "detection_history"
+HISTORY_DIR.mkdir(exist_ok=True)
+
+
+def _save_history_entry(entry):
+    """Append one detection entry to today's JSONL file on disk."""
+    try:
+        day_str = entry["ts"][:10]   # "YYYY-MM-DD"
+        day_dir = HISTORY_DIR / day_str
+        day_dir.mkdir(exist_ok=True)
+        line = json.dumps(entry, ensure_ascii=False)
+        with open(day_dir / "detections.jsonl", "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as e:
+        print(f"[History] Save error: {e}")
+
+
+def _load_history():
+    """Load all past detection history from disk into detection_history list."""
+    try:
+        for day_dir in sorted(HISTORY_DIR.iterdir()):
+            jl = day_dir / "detections.jsonl"
+            if not jl.exists():
+                continue
+            with open(jl, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        detection_history.append(json.loads(line))
+        print(f"[History] Loaded {len(detection_history)} entries from disk")
+    except Exception as e:
+        print(f"[History] Load error: {e}")
+
 
 # Placeholder refs for the distance sensor labels in the HA panel (set during UI build)
 distance_dot_lbl = None
@@ -497,14 +534,16 @@ def queue_worker():
 
                 _b = item["image_b64"]
                 _ti = full_text_prompt
-                detection_history.append({
+                _hist = {
                     "ts":            ts_str,
                     "cam_name":      cam.cam_name_var.get() if cam is not None else "—",
                     "vision_result": vision_result,
                     "text_result":   text_result,
                     "image_b64":     _b,
                     "elapsed":       time.time() - item["trigger_ts"],
-                })
+                }
+                detection_history.append(_hist)
+                _save_history_entry(_hist)
                 if cam is not None:
                     root.after(0, lambda b=_b, vr=vision_result, ti=_ti, tr=text_result,
                                         t=ts_str, e=elapsed, c=cam:
@@ -565,14 +604,16 @@ def queue_worker():
 
             _b64 = crop_b64
             _ti  = full_text_prompt
-            detection_history.append({
+            _hist = {
                 "ts":            ts_str,
                 "cam_name":      cam.cam_name_var.get() if cam is not None else "—",
                 "vision_result": vision_result,
                 "text_result":   text_result,
                 "image_b64":     _b64,
                 "elapsed":       time.time() - item["trigger_ts"],
-            })
+            }
+            detection_history.append(_hist)
+            _save_history_entry(_hist)
             if cam is not None:
                 root.after(0, lambda b=_b64, vr=vision_result, ti=_ti, tr=text_result,
                                     t=ts_str, e=elapsed, c=cam:
@@ -793,7 +834,7 @@ def load_config():
 # ---------------------------------------------------------------
 root = tk.Tk()
 root.title("Security Vision — Preston" + (" [DEBUG]" if DEBUG_MODE else ""))
-root.geometry("1200x900")
+root.geometry("2400x900")
 root.configure(bg="#0a0a0a")
 root.resizable(True, True)
 
@@ -1207,7 +1248,8 @@ notebook.bind("<<NotebookTabChanged>>", _on_tab_changed)
 # ---------------------------------------------------------------
 # START SERVICES
 # ---------------------------------------------------------------
-load_config()   # rebuilds camera tabs from saved config
+_load_history()   # restore past detections from disk
+load_config()     # rebuilds camera tabs from saved config
 
 # First run: no saved cameras yet → give the user an empty starting tab.
 if not cameras:
