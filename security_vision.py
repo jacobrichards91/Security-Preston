@@ -17,6 +17,7 @@ from constants import (
     DEFAULT_VISION_MODEL, DEFAULT_TEXT_MODEL,
     CHICAGO_TZ, WEBHOOK_PORT, SAVE_DIR, CONFIG_PATH,
     DEBUG_MODE, DEFAULT_VISION_PROMPT, DEFAULT_TEXT_PROMPT,
+    DEFAULT_STRING_PROMPT,
     HA_HOST, HA_TOKEN, WATCHED_ENTITIES, HA_NAMES, HA_GROUPS,
 )
 from priority_queue import NewestFirstQueue
@@ -24,6 +25,7 @@ from motion import compute_motion_crop, compute_distance
 from ollama_api import fmt_size, list_models, warmup, analyze_image_bytes, analyze_text
 from synthetic_sensors import SyntheticSensors
 from camera_tab import CameraTab
+from string_detector import StringManager
 
 system_active = threading.Event()
 system_active.set()           # ON by default
@@ -63,19 +65,34 @@ def _save_history_entry(entry):
         print(f"[History] Save error: {e}")
 
 
+# Temporary buffer — strings loaded before the Strings tab UI exists.
+_loaded_strings = []
+
+
 def _load_history():
-    """Load all past detection history from disk into detection_history list."""
+    """Load all past detection history and strings from disk."""
     try:
         for day_dir in sorted(HISTORY_DIR.iterdir()):
-            jl = day_dir / "detections.jsonl"
-            if not jl.exists():
+            if not day_dir.is_dir():
                 continue
-            with open(jl, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        detection_history.append(json.loads(line))
-        print(f"[History] Loaded {len(detection_history)} entries from disk")
+            # Load detections
+            jl = day_dir / "detections.jsonl"
+            if jl.exists():
+                with open(jl, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            detection_history.append(json.loads(line))
+            # Load strings
+            sl = day_dir / "strings.jsonl"
+            if sl.exists():
+                with open(sl, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            _loaded_strings.append(json.loads(line))
+        print(f"[History] Loaded {len(detection_history)} detections, "
+              f"{len(_loaded_strings)} strings from disk")
     except Exception as e:
         print(f"[History] Load error: {e}")
 
@@ -544,6 +561,10 @@ def queue_worker():
                 }
                 detection_history.append(_hist)
                 _save_history_entry(_hist)
+                # Feed string detector (no distance for manual uploads)
+                string_mgr.feed(ts_str,
+                                cam.cam_name_var.get() if cam else "—",
+                                vision_result, None, _b)
                 if cam is not None:
                     root.after(0, lambda b=_b, vr=vision_result, ti=_ti, tr=text_result,
                                         t=ts_str, e=elapsed, c=cam:
@@ -614,6 +635,10 @@ def queue_worker():
             }
             detection_history.append(_hist)
             _save_history_entry(_hist)
+            # Feed string detector with cross-camera distance info
+            string_mgr.feed(ts_str,
+                            cam.cam_name_var.get() if cam else "—",
+                            vision_result, distance, _b64)
             if cam is not None:
                 root.after(0, lambda b=_b64, vr=vision_result, ti=_ti, tr=text_result,
                                     t=ts_str, e=elapsed, c=cam:
@@ -782,6 +807,7 @@ def save_config(*_):
             "vision_prompt":   vision_prompt_text.get("1.0", tk.END).rstrip("\n"),
             "text_prompt":     text_prompt_text.get("1.0", tk.END).rstrip("\n"),
             "system_active":   system_active_var.get(),
+            "string_prompt":   string_prompt_text.get("1.0", tk.END).rstrip("\n"),
             # Only persist cameras that have been verified by a live frame.
             "cameras":         [c.to_dict() for c in cameras if c.verified],
         }
@@ -818,6 +844,9 @@ def load_config():
             text_prompt_text.insert("1.0", data["text_prompt"])
         if "system_active" in data:
             system_active_var.set(data["system_active"])
+        if "string_prompt" in data:
+            string_prompt_text.delete("1.0", tk.END)
+            string_prompt_text.insert("1.0", data["string_prompt"])
         # Rebuild each saved camera tab.
         for cam_data in data.get("cameras", []):
             cam = add_camera_tab(initial_data=cam_data, autostart=True)
@@ -884,10 +913,11 @@ style.configure("Dark.TCombobox",
 notebook = ttk.Notebook(root, style="Dark.TNotebook")
 notebook.pack(fill=tk.BOTH, expand=True)
 
-# Master tab is always present. Camera tabs are inserted BEFORE it at runtime.
-# A ghost "+" tab lives after Master; selecting it creates a new camera tab.
+# Tab order: [Master | Strings | Camera1 | Camera2 | … | +]
 tab_master = tk.Frame(notebook, bg="#0a0a0a")
 notebook.add(tab_master, text="Master")
+tab_strings = tk.Frame(notebook, bg="#0a0a0a")
+notebook.add(tab_strings, text="Strings")
 _plus_tab = tk.Frame(notebook, bg="#0a0a0a")
 notebook.add(_plus_tab, text="  +  ")
 
@@ -1180,6 +1210,230 @@ master_input_text  = _make_det_col(det_inner, "TEXT MODEL INPUT", font_size=7, f
 master_result_text = _make_det_col(det_inner, "JUDGMENT",       font_size=9, fg="#e0e0e0")
 
 # ═══════════════════════════════════════════════
+# STRINGS TAB  (cross-camera detection clusters)
+# ═══════════════════════════════════════════════
+
+# Status badge at top of Strings tab
+_string_status_var = tk.StringVar(value="○  No active string")
+_string_status_lbl = tk.Label(
+    tab_strings, textvariable=_string_status_var,
+    bg="#0d0d0d", fg="#333333", font=("Courier New", 9, "bold"),
+    anchor="w", padx=14, pady=6)
+_string_status_lbl.pack(fill=tk.X, side=tk.TOP)
+tk.Frame(tab_strings, bg="#1a1a1a", height=1).pack(fill=tk.X, side=tk.TOP)
+
+_string_cols = tk.Frame(tab_strings, bg="#0a0a0a")
+_string_cols.pack(fill=tk.BOTH, expand=True)
+
+# ── LEFT: observation timeline + judgment output ────────
+_str_left = tk.Frame(_string_cols, bg="#0a0a0a")
+_str_left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(14, 8), pady=10)
+
+tk.Label(_str_left, text="OBSERVATION TIMELINE", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 4))
+_str_timeline_frame = tk.Frame(_str_left, bg="#0a0a0a")
+_str_timeline_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+string_timeline_text = tk.Text(
+    _str_timeline_frame, bg="#111111", fg="#888888",
+    font=("Courier New", 9), relief=tk.FLAT,
+    padx=8, pady=6, wrap=tk.WORD, height=8,
+    state=tk.DISABLED, selectbackground="#003322")
+_str_tl_scr = tk.Scrollbar(_str_timeline_frame, command=string_timeline_text.yview, bg="#111111")
+string_timeline_text.configure(yscrollcommand=_str_tl_scr.set)
+_str_tl_scr.pack(side=tk.RIGHT, fill=tk.Y)
+string_timeline_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+tk.Label(_str_left, text="STRING JUDGMENT", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 4))
+_str_judgment_frame = tk.Frame(_str_left, bg="#0a0a0a")
+_str_judgment_frame.pack(fill=tk.BOTH, expand=True)
+string_judgment_text = tk.Text(
+    _str_judgment_frame, bg="#111111", fg="#e0e0e0",
+    font=("Courier New", 10), relief=tk.FLAT,
+    padx=8, pady=6, wrap=tk.WORD, height=8,
+    state=tk.DISABLED, selectbackground="#003322")
+_str_jg_scr = tk.Scrollbar(_str_judgment_frame, command=string_judgment_text.yview, bg="#111111")
+string_judgment_text.configure(yscrollcommand=_str_jg_scr.set)
+_str_jg_scr.pack(side=tk.RIGHT, fill=tk.Y)
+string_judgment_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+# ── RIGHT: string prompt editor + past strings list ────
+_str_right = tk.Frame(_string_cols, bg="#0d0d0d", width=360)
+_str_right.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 0), pady=0)
+_str_right.pack_propagate(False)
+
+tk.Label(_str_right, text="STRING PROMPT", bg="#0d0d0d", fg="#444444",
+         font=("Courier New", 8, "bold"), padx=12).pack(anchor="w", pady=(10, 4))
+_str_prompt_frame = tk.Frame(_str_right, bg="#0d0d0d")
+_str_prompt_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
+string_prompt_text = tk.Text(
+    _str_prompt_frame, bg="#111111", fg="#999999",
+    font=("Courier New", 9), relief=tk.FLAT,
+    padx=8, pady=6, wrap=tk.WORD, height=10,
+    insertbackground="#00ff88", selectbackground="#003322")
+_str_ps = tk.Scrollbar(_str_prompt_frame, command=string_prompt_text.yview, bg="#111111")
+string_prompt_text.configure(yscrollcommand=_str_ps.set)
+_str_ps.pack(side=tk.RIGHT, fill=tk.Y)
+string_prompt_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+string_prompt_text.insert(tk.END, DEFAULT_STRING_PROMPT)
+string_prompt_text.bind("<KeyRelease>", schedule_save)
+string_prompt_text.bind("<<Paste>>",    schedule_save)
+
+tk.Label(_str_right, text="PAST STRINGS", bg="#0d0d0d", fg="#444444",
+         font=("Courier New", 8, "bold"), padx=12).pack(anchor="w", pady=(0, 4))
+_str_hist_frame = tk.Frame(_str_right, bg="#0d0d0d")
+_str_hist_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 10))
+string_history_listbox = tk.Listbox(
+    _str_hist_frame, bg="#111111", fg="#888888",
+    font=("Courier New", 9), relief=tk.FLAT,
+    selectbackground="#003322", selectforeground="#00ff88",
+    activestyle="none", borderwidth=0, highlightthickness=0)
+_str_hl_scr = tk.Scrollbar(_str_hist_frame, command=string_history_listbox.yview, bg="#111111")
+string_history_listbox.configure(yscrollcommand=_str_hl_scr.set)
+_str_hl_scr.pack(side=tk.RIGHT, fill=tk.Y)
+string_history_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+
+# ── Tab flash animation for active strings ──────────────
+_tab_flash_state = {"on": False, "job": None}
+
+def _flash_strings_tab():
+    """Toggle the Strings tab text color between green and normal."""
+    if _tab_flash_state["on"]:
+        try:
+            idx = notebook.index(tab_strings)
+            current_fg = style.map("Dark.TNotebook.Tab")
+            # We can't style individual tabs with ttk easily, so use a
+            # name-toggle approach: alternate the tab text itself.
+            cur = notebook.tab(tab_strings, "text")
+            if "●" in cur:
+                notebook.tab(tab_strings, text="Strings")
+            else:
+                notebook.tab(tab_strings, text="● Strings")
+        except Exception:
+            pass
+        _tab_flash_state["job"] = root.after(600, _flash_strings_tab)
+
+def _start_tab_flash():
+    _tab_flash_state["on"] = True
+    _flash_strings_tab()
+
+def _stop_tab_flash():
+    _tab_flash_state["on"] = False
+    if _tab_flash_state["job"]:
+        root.after_cancel(_tab_flash_state["job"])
+        _tab_flash_state["job"] = None
+    try:
+        notebook.tab(tab_strings, text="Strings")
+    except Exception:
+        pass
+
+
+def _update_string_timeline(s):
+    """Refresh the observation timeline text widget (main thread)."""
+    string_timeline_text.config(state=tk.NORMAL)
+    string_timeline_text.delete("1.0", tk.END)
+    string_timeline_text.tag_configure("ts",  foreground="#00aaff", font=("Courier New", 9, "bold"))
+    string_timeline_text.tag_configure("cam", foreground="#00ff88", font=("Courier New", 9))
+    string_timeline_text.tag_configure("vis", foreground="#888888", font=("Courier New", 9))
+    string_timeline_text.tag_configure("dist", foreground="#ff8800", font=("Courier New", 8))
+
+    for o in s.observations:
+        string_timeline_text.insert(tk.END, f"{o['ts']}  ", "ts")
+        string_timeline_text.insert(tk.END, f"[{o['cam_name']}]", "cam")
+        if o.get("distance"):
+            string_timeline_text.insert(tk.END, f"  ({o['distance']})", "dist")
+        string_timeline_text.insert(tk.END, "\n")
+        string_timeline_text.insert(tk.END, f"  {o['vision_result']}\n\n", "vis")
+
+    string_timeline_text.config(state=tk.DISABLED)
+    string_timeline_text.see(tk.END)
+
+
+def _update_string_judgment(s):
+    """Refresh the judgment output text widget (main thread)."""
+    string_judgment_text.config(state=tk.NORMAL)
+    string_judgment_text.delete("1.0", tk.END)
+    string_judgment_text.insert(tk.END, s.judgment_text)
+    string_judgment_text.config(state=tk.DISABLED)
+
+
+def _on_string_opened(s):
+    """Called on main thread when a new string starts."""
+    _string_status_var.set(f"●  ACTIVE — {s.name}  ({len(s.observations)} obs)")
+    _string_status_lbl.config(fg="#00ff88")
+    _start_tab_flash()
+    _update_string_timeline(s)
+
+
+def _on_string_judgment(s):
+    """Called on main thread after each string judgment completes."""
+    _string_status_var.set(f"●  ACTIVE — {s.name}  ({len(s.observations)} obs)")
+    _update_string_timeline(s)
+    _update_string_judgment(s)
+
+
+def _on_string_closed(s):
+    """Called on main thread when a string closes."""
+    _stop_tab_flash()
+    _string_status_var.set(f"○  Closed — {s.name}  ({len(s.observations)} obs)")
+    _string_status_lbl.config(fg="#666666")
+    # Add to past strings listbox (newest first)
+    string_history_listbox.insert(0, f"  {s.name}  ({len(s.observations)} obs)")
+    # Add to detection history on disk
+    _save_history_entry({
+        "type":         "string",
+        "ts":           s.start_ts_str,
+        "cam_name":     s.name,
+        "vision_result": "\n".join(f"[{o['cam_name']}] {o['vision_result']}" for o in s.observations),
+        "text_result":  s.judgment_text,
+        "image_b64":    s.observations[0].get("image_b64", "") if s.observations else "",
+        "elapsed":      s.total_duration(),
+    })
+
+
+def _save_string_to_disk(string_dict):
+    """Persist a closed string to the history directory."""
+    try:
+        day_str = string_dict["start_ts"][:10]
+        day_dir = HISTORY_DIR / day_str
+        day_dir.mkdir(exist_ok=True)
+        line = json.dumps(string_dict, ensure_ascii=False)
+        with open(day_dir / "strings.jsonl", "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as e:
+        print(f"[String] Disk save error: {e}")
+
+
+# Click a past string to view it
+def _on_past_string_select(evt):
+    sel = string_history_listbox.curselection()
+    if not sel:
+        return
+    idx = sel[0]
+    if idx < len(string_mgr.history):
+        s = string_mgr.history[len(string_mgr.history) - 1 - idx]
+        _update_string_timeline(s)
+        _update_string_judgment(s)
+
+string_history_listbox.bind("<<ListboxSelect>>", _on_past_string_select)
+
+# Instantiate the StringManager (prompt widget is ready now)
+string_mgr = StringManager(
+    root=root,
+    text_model_var=text_model_var,
+    string_prompt_text=string_prompt_text,
+    build_ha_context=build_ha_context,
+    analyze_text_fn=analyze_text,
+    on_judgment_ready=_on_string_judgment,
+    on_string_opened=_on_string_opened,
+    on_string_closed=_on_string_closed,
+    chicago_tz=CHICAGO_TZ,
+    save_fn=_save_string_to_disk,
+)
+
+
+# ═══════════════════════════════════════════════
 # CAMERA TAB MANAGEMENT  (multi-camera: "+" tab adds new cameras)
 # ═══════════════════════════════════════════════
 
@@ -1250,6 +1504,19 @@ notebook.bind("<<NotebookTabChanged>>", _on_tab_changed)
 # ---------------------------------------------------------------
 _load_history()   # restore past detections from disk
 load_config()     # rebuilds camera tabs from saved config
+
+# Populate past strings list from disk (loaded before UI existed)
+from string_detector import DetectionString as _DS
+for _sd in _loaded_strings:
+    _s = _DS(_sd.get("start_ts", ""))
+    _s.name = _sd.get("name", _s.name)
+    _s.observations = _sd.get("observations", [])
+    _s.judgment_text = _sd.get("judgment_text", "")
+    _s.closed = True
+    string_mgr.history.append(_s)
+    # Insert at top so newest-first matches _on_past_string_select
+    string_history_listbox.insert(0, f"  {_s.name}  ({len(_s.observations)} obs)")
+_loaded_strings.clear()
 
 # First run: no saved cameras yet → give the user an empty starting tab.
 if not cameras:
