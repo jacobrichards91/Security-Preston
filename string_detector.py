@@ -2,8 +2,11 @@
 string_detector.py — Detection String manager.
 
 A "string" is a cluster of rapid-fire detections (more than 1 per minute).
-Each observation that arrives within 60s of the previous one extends the
-active string.  A string auto-closes after 60s of silence or 5 min total.
+Each observation that arrives within 30s of the previous one extends the
+active string.  A string auto-closes after 30s of silence or 2 min total.
+
+When 2+ unique cameras contribute to a string, ADVANCED MODE activates:
+continuous motion scanning on all cameras until the string closes.
 
 The string judgment (text model) re-runs every time a new observation is
 added, seeing ALL observations in the string.  Output goes only to the
@@ -45,11 +48,18 @@ class DetectionString:
         self.observations   = []            # list of observation dicts
         self.judgment_text  = ""            # latest AI judgment result
         self.closed         = False
+        self.advanced_mode  = False         # True once 2+ unique cameras seen
+        self._unique_cams   = set()
         self._last_obs_time = time.time()   # wall-clock of last added obs
 
     def add_observation(self, obs):
         self.observations.append(obs)
         self._last_obs_time = time.time()
+        self._unique_cams.add(obs.get("cam_name", ""))
+
+    @property
+    def unique_camera_count(self):
+        return len(self._unique_cams)
 
     def seconds_since_last(self):
         return time.time() - self._last_obs_time
@@ -73,13 +83,14 @@ class DetectionString:
             "observations":  self.observations,
             "judgment_text": self.judgment_text,
             "closed":        self.closed,
+            "advanced_mode": self.advanced_mode,
         }
 
 
 # ── StringManager ─────────────────────────────────────────────────────────────
 
-STRING_IDLE_TIMEOUT  = 60    # close after 60s with no new observation
-STRING_MAX_DURATION  = 300   # hard close after 5 minutes
+STRING_IDLE_TIMEOUT  = 30    # close after 30s with no new observation
+STRING_MAX_DURATION  = 120   # hard close after 2 minutes
 
 class StringManager:
     """
@@ -87,21 +98,24 @@ class StringManager:
     thread and the main (UI) thread.
 
     Constructor args:
-      root             — Tk root (for root.after scheduling)
-      text_model_var   — tk.StringVar with current text model name
+      root               — Tk root (for root.after scheduling)
+      text_model_var     — tk.StringVar with current text model name
       string_prompt_text — tk.Text widget holding the string judgment prompt
-      build_ha_context — callable returning HA state string
-      analyze_text_fn  — callable(prompt, model) → result string
-      on_judgment_ready — callable(string) on main thread after judgment
-      on_string_opened  — callable(string) on main thread when new string starts
-      on_string_closed  — callable(string) on main thread when string closes
-      chicago_tz       — timezone object
-      save_fn          — callable(string_dict) to persist a closed string
+      build_ha_context   — callable returning HA state string
+      analyze_text_fn    — callable(prompt, model) → result string
+      on_judgment_ready  — callable(string) on main thread after judgment
+      on_string_opened   — callable(string) on main thread when new string starts
+      on_string_closed   — callable(string) on main thread when string closes
+      on_advanced_start  — callable(string) on main thread when advanced mode activates
+      on_advanced_stop   — callable(string) on main thread when advanced mode deactivates
+      chicago_tz         — timezone object
+      save_fn            — callable(string_dict) to persist a closed string
     """
 
     def __init__(self, *, root, text_model_var, string_prompt_text,
                  build_ha_context, analyze_text_fn,
                  on_judgment_ready, on_string_opened, on_string_closed,
+                 on_advanced_start, on_advanced_stop,
                  chicago_tz, save_fn):
         self._root              = root
         self._text_model_var    = text_model_var
@@ -111,6 +125,8 @@ class StringManager:
         self._on_judgment       = on_judgment_ready
         self._on_opened         = on_string_opened
         self._on_closed         = on_string_closed
+        self._on_adv_start      = on_advanced_start
+        self._on_adv_stop       = on_advanced_stop
         self._tz                = chicago_tz
         self._save_fn           = save_fn
 
@@ -135,25 +151,25 @@ class StringManager:
 
             if self._active is not None and not self._active.closed:
                 # Extend active string
+                was_advanced = self._active.advanced_mode
                 self._active.add_observation(obs)
                 self._schedule_close_check()
                 self._request_judgment()
+                # Check if we just crossed into advanced mode (2+ unique cameras)
+                if not was_advanced and self._active.unique_camera_count >= 2:
+                    self._active.advanced_mode = True
+                    s = self._active
+                    self._root.after(0, lambda: self._on_adv_start(s))
                 return
 
-            # No active string — check if this detection is within 60s of
-            # the last detection (from detection_history).
-            # The caller checks this and only calls feed() when appropriate,
-            # OR we can keep it simple: if we have no active string we need
-            # at least 2 detections within 60s.  Since the caller will call
-            # feed() for EVERY detection, we store a "pending first" and
-            # start the string when a second arrives within 60s.
+            # No active string — need 2 detections within idle timeout to start.
             if not hasattr(self, '_pending_obs') or self._pending_obs is None:
                 self._pending_obs = (obs, now)
                 return
 
             prev_obs, prev_time = self._pending_obs
             if now - prev_time <= STRING_IDLE_TIMEOUT:
-                # Two detections within 60s — start a string!
+                # Two detections within timeout — start a string!
                 s = DetectionString(prev_obs["ts"])
                 s.add_observation(prev_obs)
                 s.add_observation(obs)
@@ -162,6 +178,10 @@ class StringManager:
                 self._schedule_close_check()
                 self._root.after(0, lambda: self._on_opened(s))
                 self._request_judgment()
+                # Check if already 2 unique cameras at birth
+                if s.unique_camera_count >= 2:
+                    s.advanced_mode = True
+                    self._root.after(0, lambda: self._on_adv_start(s))
             else:
                 # Gap too long — replace pending with new obs
                 self._pending_obs = (obs, now)
@@ -172,8 +192,8 @@ class StringManager:
         """Schedule an idle-timeout check on the main thread."""
         if self._close_timer is not None:
             self._root.after_cancel(self._close_timer)
-        # Check every 5 seconds
-        self._close_timer = self._root.after(5000, self._check_close)
+        # Check every 3 seconds
+        self._close_timer = self._root.after(3000, self._check_close)
 
     def _check_close(self):
         with self._lock:
@@ -183,11 +203,14 @@ class StringManager:
             idle = s.seconds_since_last()
             total = s.total_duration()
             if idle >= STRING_IDLE_TIMEOUT or total >= STRING_MAX_DURATION:
+                was_advanced = s.advanced_mode
                 s.closed = True
                 self.history.append(s)
                 self._active = None
                 self._save_fn(s.to_dict())
                 self._root.after(0, lambda: self._on_closed(s))
+                if was_advanced:
+                    self._root.after(0, lambda: self._on_adv_stop(s))
                 return
         # Still active — keep checking
         self._schedule_close_check()
@@ -248,11 +271,13 @@ class StringManager:
 
         ha_context = self._build_ha()
 
+        mode_label = "ADVANCED MODE — " if s.advanced_mode else ""
+
         return (
             f"{user_prompt}\n\n"
             f"Time: {chicago_now}\n\n"
             f"Home state:\n{ha_context}\n\n"
-            f"STRING ANALYSIS — {len(s.observations)} detections "
+            f"{mode_label}STRING ANALYSIS — {len(s.observations)} detections "
             f"over {s.total_duration():.0f} seconds\n\n"
             + "\n\n".join(obs_lines)
         )

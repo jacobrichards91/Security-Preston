@@ -21,7 +21,7 @@ from constants import (
     HA_HOST, HA_TOKEN, WATCHED_ENTITIES, HA_NAMES, HA_GROUPS,
 )
 from priority_queue import NewestFirstQueue
-from motion import compute_motion_crop, compute_distance
+from motion import compute_motion_crop, compute_distance, jpeg_apply_mask
 from ollama_api import fmt_size, list_models, warmup, analyze_image_bytes, analyze_text
 from synthetic_sensors import SyntheticSensors
 from camera_tab import CameraTab
@@ -866,6 +866,8 @@ def save_config(*_):
             "text_prompt":     text_prompt_text.get("1.0", tk.END).rstrip("\n"),
             "system_active":   system_active_var.get(),
             "string_prompt":   string_prompt_text.get("1.0", tk.END).rstrip("\n"),
+            "adv_threshold":   adv_threshold_var.get(),
+            "adv_scan_interval": adv_scan_interval_var.get(),
             # Only persist cameras that have been verified by a live frame.
             "cameras":         [c.to_dict() for c in cameras if c.verified],
         }
@@ -905,6 +907,10 @@ def load_config():
         if "string_prompt" in data:
             string_prompt_text.delete("1.0", tk.END)
             string_prompt_text.insert("1.0", data["string_prompt"])
+        if "adv_threshold" in data:
+            adv_threshold_var.set(data["adv_threshold"])
+        if "adv_scan_interval" in data:
+            adv_scan_interval_var.set(data["adv_scan_interval"])
         # Rebuild each saved camera tab.
         for cam_data in data.get("cameras", []):
             cam = add_camera_tab(initial_data=cam_data, autostart=True)
@@ -1340,6 +1346,50 @@ _str_right.pack_propagate(False)
 
 tk.Label(_str_right, text="STRING PROMPT", bg="#0d0d0d", fg="#444444",
          font=("Courier New", 8, "bold"), padx=12).pack(anchor="w", pady=(10, 4))
+
+# ── Advanced mode settings ──
+_adv_frame = tk.Frame(_str_right, bg="#0d0d0d")
+_adv_frame.pack(fill=tk.X, padx=12, pady=(0, 8))
+tk.Label(_adv_frame, text="ADVANCED MODE", bg="#0d0d0d", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 4))
+tk.Label(_adv_frame, text="Activates when 2+ cameras detect motion",
+         bg="#0d0d0d", fg="#333333", font=("Courier New", 7)).pack(anchor="w")
+
+_adv_settings = tk.Frame(_adv_frame, bg="#0d0d0d")
+_adv_settings.pack(fill=tk.X, pady=(4, 0))
+
+tk.Label(_adv_settings, text="motion threshold", bg="#0d0d0d", fg="#555555",
+         font=("Courier New", 8)).pack(side=tk.LEFT)
+adv_threshold_var = tk.DoubleVar(value=0.01)   # very low default
+tk.Spinbox(_adv_settings, textvariable=adv_threshold_var,
+           from_=0.001, to=5.0, increment=0.005, format="%.3f", width=7,
+           bg="#111111", fg="#00ff88", buttonbackground="#1a1a1a",
+           relief=tk.FLAT, font=("Courier New", 9),
+           insertbackground="#00ff88", highlightthickness=0
+           ).pack(side=tk.LEFT, padx=(4, 2))
+tk.Label(_adv_settings, text="%", bg="#0d0d0d", fg="#444444",
+         font=("Courier New", 8)).pack(side=tk.LEFT, padx=(0, 12))
+
+tk.Label(_adv_settings, text="scan interval", bg="#0d0d0d", fg="#555555",
+         font=("Courier New", 8)).pack(side=tk.LEFT)
+adv_scan_interval_var = tk.DoubleVar(value=1.0)   # 1s between pairs
+tk.Spinbox(_adv_settings, textvariable=adv_scan_interval_var,
+           from_=0.5, to=5.0, increment=0.5, format="%.1f", width=5,
+           bg="#111111", fg="#00ff88", buttonbackground="#1a1a1a",
+           relief=tk.FLAT, font=("Courier New", 9),
+           insertbackground="#00ff88", highlightthickness=0
+           ).pack(side=tk.LEFT, padx=(4, 2))
+tk.Label(_adv_settings, text="s", bg="#0d0d0d", fg="#444444",
+         font=("Courier New", 8)).pack(side=tk.LEFT)
+
+_adv_status_var = tk.StringVar(value="")
+_adv_status_lbl = tk.Label(_adv_frame, textvariable=_adv_status_var,
+                            bg="#0d0d0d", fg="#ff4444",
+                            font=("Courier New", 8, "bold"))
+_adv_status_lbl.pack(anchor="w", pady=(4, 0))
+
+adv_threshold_var.trace_add("write", schedule_save)
+adv_scan_interval_var.trace_add("write", schedule_save)
 _str_prompt_frame = tk.Frame(_str_right, bg="#0d0d0d")
 _str_prompt_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
 string_prompt_text = tk.Text(
@@ -1488,6 +1538,96 @@ def _on_string_closed(s):
     })
 
 
+# ── Advanced mode: continuous motion scanning ────────────────────────
+_adv_scanner_running = False
+
+def _on_advanced_start(s):
+    """Called on main thread when 2+ cameras trigger advanced mode."""
+    global _adv_scanner_running
+    _adv_status_var.set("● ADVANCED MODE ACTIVE — continuous scanning")
+    _adv_status_lbl.config(fg="#ff4444")
+    _string_status_var.set(
+        f"●  ADVANCED — {s.name}  ({len(s.observations)} obs, "
+        f"{s.unique_camera_count} cameras)")
+    if not _adv_scanner_running:
+        _adv_scanner_running = True
+        # Ensure all cameras with RTSP are streaming
+        for cam in cameras:
+            if cam.rtsp_url_var.get().strip() and not cam._stream_running:
+                cam.start_stream()
+                print(f"[Advanced] Auto-started stream on {cam.cam_name_var.get()}")
+        threading.Thread(target=_advanced_scanner_worker, daemon=True).start()
+
+
+def _on_advanced_stop(s):
+    """Called on main thread when advanced mode deactivates."""
+    global _adv_scanner_running
+    _adv_scanner_running = False
+    _adv_status_var.set("")
+
+
+def _advanced_scanner_worker():
+    """
+    Continuous motion scanner — runs while advanced mode is active.
+    Every scan_interval seconds, for each camera:
+      1. Grab frame A (now), wait 0.5s, grab frame B
+      2. Apply masks, run motion detection with the low threshold
+      3. If motion found → enqueue through normal pipeline
+    """
+    print("[Advanced] Scanner started")
+    while _adv_scanner_running:
+        interval = adv_scan_interval_var.get()
+        threshold = adv_threshold_var.get()
+        cycle_start = time.time()
+
+        for cam in cameras:
+            if not _adv_scanner_running:
+                break
+            if not cam.rtsp_url_var.get().strip() or not cam._stream_running:
+                continue
+
+            try:
+                # Grab frame pair: A = now, B = 0.5s later
+                frame_a = cam.get_frame_at(time.time())
+                if frame_a is None:
+                    continue
+                time.sleep(0.5)
+                if not _adv_scanner_running:
+                    break
+                frame_b = cam.get_frame_at(time.time())
+                if frame_b is None:
+                    continue
+
+                # Apply mask zones
+                if cam.mask_rects:
+                    frame_a = jpeg_apply_mask(frame_a, cam.mask_rects)
+                    frame_b = jpeg_apply_mask(frame_b, cam.mask_rects)
+
+                # Motion detection with the low advanced threshold
+                cropped_bytes, _, bbox = compute_motion_crop(
+                    frame_a, frame_b, threshold, cam.crop_padding_var.get()
+                )
+
+                if cropped_bytes is not None:
+                    # Motion detected — enqueue through normal pipeline
+                    ts_float = time.time()
+                    ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    cam_name = cam.cam_name_var.get()
+                    print(f"[Advanced] Motion on {cam_name} — enqueuing")
+                    cam.enqueue_event(ts_float, ts_str, source="advanced")
+
+            except Exception as e:
+                print(f"[Advanced] Scan error on {cam.cam_name_var.get()}: {e}")
+
+        # Wait remaining interval time
+        elapsed = time.time() - cycle_start
+        remaining = max(0, interval - elapsed)
+        if remaining > 0 and _adv_scanner_running:
+            time.sleep(remaining)
+
+    print("[Advanced] Scanner stopped")
+
+
 def _save_string_to_disk(string_dict):
     """Persist a closed string to the history directory."""
     try:
@@ -1524,6 +1664,8 @@ string_mgr = StringManager(
     on_judgment_ready=_on_string_judgment,
     on_string_opened=_on_string_opened,
     on_string_closed=_on_string_closed,
+    on_advanced_start=_on_advanced_start,
+    on_advanced_stop=_on_advanced_stop,
     chicago_tz=CHICAGO_TZ,
     save_fn=_save_string_to_disk,
 )

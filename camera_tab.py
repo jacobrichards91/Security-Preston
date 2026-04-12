@@ -351,7 +351,7 @@ class CameraTab:
     def enqueue_event(self, ts_float, ts_str, source="webhook", image_b64=None):
         app = self.app_refs
         frame_a = frame_b = None
-        if source == "webhook":
+        if source in ("webhook", "advanced"):
             ts_a   = ts_float - self.snap_before_var.get()
             ts_b   = ts_float - self.snap_after_var.get()
             frame_a = self.get_frame_at(ts_a)
