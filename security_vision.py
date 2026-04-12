@@ -139,7 +139,7 @@ def show_debug_window(debug_images):
     """Show/update a Toplevel window with all debug frames."""
     global debug_window, debug_labels
 
-    if not DEBUG_MODE:
+    if not debug_mode_var.get():
         return
 
     if debug_window is None or not debug_window.winfo_exists():
@@ -408,14 +408,17 @@ def open_history_window():
     _history_win = tk.Toplevel(root)
     _history_win.title("Detection History")
     _history_win.configure(bg="#0a0a0a")
-    _history_win.geometry("960x580")
+    _history_win.geometry("960x620")
     _history_win.resizable(True, True)
+
+    # Refs to keep PhotoImages alive
+    _hist_photos = []
 
     pane = tk.Frame(_history_win, bg="#0a0a0a")
     pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
     # ── LEFT: detection list ─────────────────────────────────────────
-    left = tk.Frame(pane, bg="#111111", width=290)
+    left = tk.Frame(pane, bg="#111111", width=310)
     left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
     left.pack_propagate(False)
 
@@ -436,7 +439,10 @@ def open_history_window():
 
     for entry in reversed(detection_history):   # newest first
         secs = entry.get("elapsed", 0)
-        listbox.insert(tk.END, f"  {entry['ts']}  [{entry['cam_name']}]  {secs:.1f}s")
+        if entry.get("type") == "string":
+            listbox.insert(tk.END, f"  ▶ {entry['ts']}  {entry['cam_name']}  {secs:.0f}s")
+        else:
+            listbox.insert(tk.END, f"  {entry['ts']}  [{entry['cam_name']}]  {secs:.1f}s")
 
     if not detection_history:
         listbox.insert(tk.END, "  — no detections yet —")
@@ -445,64 +451,116 @@ def open_history_window():
     right = tk.Frame(pane, bg="#0a0a0a")
     right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-    detail_img_lbl = tk.Label(right, bg="#111111", text="—", fg="#333333",
-                               font=("Courier New", 8), width=28, height=8, anchor="center")
-    detail_img_lbl.pack(anchor="nw", pady=(0, 6))
+    tk.Label(right, text="VISION", bg="#0a0a0a", fg="#444444",
+             font=("Courier New", 8, "bold")).pack(anchor="w")
+    _vis_frame = tk.Frame(right, bg="#0a0a0a")
+    _vis_frame.pack(fill=tk.BOTH, expand=True, pady=(2, 6))
+    vision_txt = tk.Text(_vis_frame, bg="#111111", fg="#666666",
+                         font=("Courier New", 8), relief=tk.FLAT,
+                         padx=6, pady=6, wrap=tk.WORD,
+                         state=tk.DISABLED, selectbackground="#003322", height=8)
+    _vs = tk.Scrollbar(_vis_frame, command=vision_txt.yview, bg="#111111")
+    vision_txt.configure(yscrollcommand=_vs.set)
+    _vs.pack(side=tk.RIGHT, fill=tk.Y)
+    vision_txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-    def _make_txt(parent, title, font_size=9, fg="#888888", height=5):
-        tk.Label(parent, text=title, bg="#0a0a0a", fg="#444444",
-                 font=("Courier New", 8, "bold")).pack(anchor="w")
-        frm = tk.Frame(parent, bg="#0a0a0a")
-        frm.pack(fill=tk.BOTH, expand=True, pady=(2, 6))
-        txt = tk.Text(frm, bg="#111111", fg=fg,
-                      font=("Courier New", font_size), relief=tk.FLAT,
-                      padx=6, pady=6, wrap=tk.WORD,
-                      state=tk.DISABLED, selectbackground="#003322", height=height)
-        scr = tk.Scrollbar(frm, command=txt.yview, bg="#111111")
-        txt.configure(yscrollcommand=scr.set)
-        scr.pack(side=tk.RIGHT, fill=tk.Y)
-        txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        return txt
-
-    vision_txt = _make_txt(right, "VISION",   font_size=8, fg="#666666", height=5)
-    judg_txt   = _make_txt(right, "JUDGMENT", font_size=9, fg="#e0e0e0", height=6)
+    tk.Label(right, text="JUDGMENT", bg="#0a0a0a", fg="#444444",
+             font=("Courier New", 8, "bold")).pack(anchor="w")
+    _jg_frame = tk.Frame(right, bg="#0a0a0a")
+    _jg_frame.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
+    judg_txt = tk.Text(_jg_frame, bg="#111111", fg="#e0e0e0",
+                       font=("Courier New", 9), relief=tk.FLAT,
+                       padx=6, pady=6, wrap=tk.WORD,
+                       state=tk.DISABLED, selectbackground="#003322", height=6)
+    _js = tk.Scrollbar(_jg_frame, command=judg_txt.yview, bg="#111111")
+    judg_txt.configure(yscrollcommand=_js.set)
+    _js.pack(side=tk.RIGHT, fill=tk.Y)
+    judg_txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
     def _on_select(evt):
         sel = listbox.curselection()
         if not sel or not detection_history:
             return
-        idx = len(detection_history) - 1 - sel[0]   # newest-first mapping
+        idx = len(detection_history) - 1 - sel[0]
         if idx < 0 or idx >= len(detection_history):
             return
         entry = detection_history[idx]
+        _hist_photos.clear()
 
-        img_b64 = entry.get("image_b64")
-        if img_b64:
-            try:
-                img = Image.open(io.BytesIO(base64.b64decode(img_b64)))
-                img.thumbnail((220, 150), Image.LANCZOS)
-                photo = ImageTk.PhotoImage(img)
-                detail_img_lbl.config(image=photo, text="",
-                                      width=img.width, height=img.height)
-                detail_img_lbl.image = photo
-            except Exception:
-                detail_img_lbl.config(image="", text="—")
+        vision_txt.config(state=tk.NORMAL)
+        vision_txt.delete("1.0", tk.END)
+
+        if entry.get("type") == "string":
+            # Show each observation with inline images
+            vision_txt.tag_configure("ts",  foreground="#00aaff", font=("Courier New", 8, "bold"))
+            vision_txt.tag_configure("cam", foreground="#00ff88", font=("Courier New", 8))
+            vision_txt.tag_configure("vis", foreground="#888888", font=("Courier New", 8))
+            # Try to load from strings.jsonl for full observation data
+            _show_string_observations(vision_txt, entry, _hist_photos)
         else:
-            detail_img_lbl.config(image="", text="—")
+            # Single detection — show image + vision text
+            img_b64 = entry.get("image_b64")
+            if img_b64:
+                try:
+                    img = Image.open(io.BytesIO(base64.b64decode(img_b64)))
+                    img.thumbnail((200, 120), Image.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                    _hist_photos.append(photo)
+                    vision_txt.image_create(tk.END, image=photo, padx=4, pady=2)
+                    vision_txt.insert(tk.END, "\n")
+                except Exception:
+                    pass
+            vision_txt.insert(tk.END, entry.get("vision_result", ""))
 
-        def _set(w, text):
-            w.config(state=tk.NORMAL)
-            w.delete("1.0", tk.END)
-            w.insert(tk.END, text)
-            w.config(state=tk.DISABLED)
+        vision_txt.config(state=tk.DISABLED)
 
-        _set(vision_txt, entry.get("vision_result", ""))
-        _set(judg_txt,   entry.get("text_result",   ""))
+        judg_txt.config(state=tk.NORMAL)
+        judg_txt.delete("1.0", tk.END)
+        judg_txt.insert(tk.END, entry.get("text_result", ""))
+        judg_txt.config(state=tk.DISABLED)
 
     listbox.bind("<<ListboxSelect>>", _on_select)
     if detection_history:
         listbox.selection_set(0)
         listbox.event_generate("<<ListboxSelect>>")
+
+
+def _show_string_observations(txt_widget, entry, photo_refs):
+    """Populate a Text widget with string observation details + inline images."""
+    txt_widget.tag_configure("ts",  foreground="#00aaff", font=("Courier New", 8, "bold"))
+    txt_widget.tag_configure("cam", foreground="#00ff88", font=("Courier New", 8))
+    txt_widget.tag_configure("vis", foreground="#888888", font=("Courier New", 8))
+    txt_widget.tag_configure("dist", foreground="#ff8800", font=("Courier New", 8))
+
+    # Try to find matching string from string_mgr.history for full observation data
+    matched_string = None
+    for s in string_mgr.history:
+        if s.name == entry.get("cam_name") and s.start_ts_str == entry.get("ts"):
+            matched_string = s
+            break
+
+    if matched_string:
+        for o in matched_string.observations:
+            txt_widget.insert(tk.END, f"{o['ts']}  ", "ts")
+            txt_widget.insert(tk.END, f"[{o['cam_name']}]", "cam")
+            if o.get("distance"):
+                txt_widget.insert(tk.END, f"  ({o['distance']})", "dist")
+            txt_widget.insert(tk.END, "\n")
+            img_b64 = o.get("image_b64")
+            if img_b64:
+                try:
+                    img = Image.open(io.BytesIO(base64.b64decode(img_b64)))
+                    img.thumbnail((180, 100), Image.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                    photo_refs.append(photo)
+                    txt_widget.image_create(tk.END, image=photo, padx=4, pady=2)
+                    txt_widget.insert(tk.END, "\n")
+                except Exception:
+                    pass
+            txt_widget.insert(tk.END, f"  {o['vision_result']}\n\n", "vis")
+    else:
+        # Fallback: just show the combined vision text
+        txt_widget.insert(tk.END, entry.get("vision_result", ""))
 
 # ---------------------------------------------------------------
 # QUEUE WORKER
@@ -884,13 +942,31 @@ system_active_var = tk.BooleanVar(value=True)
 for _v in (vision_model_var, text_model_var):
     _v.trace_add("write", schedule_save)
 
-# --- Status bar and debug (outside tabs, always visible) ---
+# --- Status bar and debug toggle (outside tabs, always visible) ---
 status_var = tk.StringVar(value="Starting...")
 tk.Label(root, textvariable=status_var, bg="#0a0a0a", fg="#444444",
          font=("Courier New", 9), anchor="w", padx=12, pady=4).pack(fill=tk.X, side=tk.BOTTOM)
-if DEBUG_MODE:
-    tk.Label(root, text="● DEBUG MODE ON", bg="#0a0a0a", fg="#ff6600",
-             font=("Courier New", 9, "bold"), anchor="e", padx=12).pack(fill=tk.X, side=tk.BOTTOM)
+
+# Debug toggle — runtime controllable (replaces compile-time constant)
+debug_mode_var = tk.BooleanVar(value=DEBUG_MODE)
+
+def _toggle_debug():
+    debug_mode_var.set(not debug_mode_var.get())
+    on = debug_mode_var.get()
+    _debug_btn.config(
+        text="● DEBUG ON" if on else "○ DEBUG OFF",
+        fg="#ff6600" if on else "#444444",
+        activeforeground="#ff6600" if on else "#444444",
+    )
+
+_debug_btn = tk.Button(
+    root, text="● DEBUG ON" if DEBUG_MODE else "○ DEBUG OFF",
+    command=_toggle_debug,
+    bg="#0a0a0a", fg="#ff6600" if DEBUG_MODE else "#444444",
+    font=("Courier New", 9, "bold"), anchor="e",
+    relief=tk.FLAT, padx=12, pady=2, cursor="hand2",
+    activebackground="#0a0a0a", activeforeground="#ff6600" if DEBUG_MODE else "#444444", bd=0)
+_debug_btn.pack(fill=tk.X, side=tk.BOTTOM)
 
 # --- Notebook (tabs) ---
 style = ttk.Style()
@@ -1329,8 +1405,14 @@ def _stop_tab_flash():
         pass
 
 
+# Keep refs to PhotoImage objects so they aren't garbage collected
+_timeline_photos = []
+
 def _update_string_timeline(s):
-    """Refresh the observation timeline text widget (main thread)."""
+    """Refresh the observation timeline text widget with images (main thread)."""
+    global _timeline_photos
+    _timeline_photos = []
+
     string_timeline_text.config(state=tk.NORMAL)
     string_timeline_text.delete("1.0", tk.END)
     string_timeline_text.tag_configure("ts",  foreground="#00aaff", font=("Courier New", 9, "bold"))
@@ -1344,6 +1426,20 @@ def _update_string_timeline(s):
         if o.get("distance"):
             string_timeline_text.insert(tk.END, f"  ({o['distance']})", "dist")
         string_timeline_text.insert(tk.END, "\n")
+
+        # Inline thumbnail
+        img_b64 = o.get("image_b64")
+        if img_b64:
+            try:
+                img = Image.open(io.BytesIO(base64.b64decode(img_b64)))
+                img.thumbnail((200, 120), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(img)
+                _timeline_photos.append(photo)
+                string_timeline_text.image_create(tk.END, image=photo, padx=4, pady=2)
+                string_timeline_text.insert(tk.END, "\n")
+            except Exception:
+                pass
+
         string_timeline_text.insert(tk.END, f"  {o['vision_result']}\n\n", "vis")
 
     string_timeline_text.config(state=tk.DISABLED)
