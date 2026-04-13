@@ -161,11 +161,12 @@ def compute_motion_in_zone(frame_a_bytes, frame_b_bytes, polygon_points,
       threshold_pct  — minimum motion as % of polygon area to trigger
 
     Returns:
-      (motion_pct, cropped_bytes, diff_b64, bbox)
-      motion_pct   — float, percent of polygon area with motion
-      cropped_bytes — JPEG bytes of the motion crop (or None)
-      diff_b64     — base64 string of the thresholded diff image (for debug)
-      bbox         — (x1, y1, x2, y2) or None
+      (motion_pct, cropped_bytes, diff_b64, annotated_b64, bbox)
+      motion_pct     — float, percent of polygon area with motion
+      cropped_bytes  — JPEG bytes of the motion crop (or None)
+      diff_b64       — base64 string of the thresholded diff image (for debug)
+      annotated_b64  — base64 string of frame B with green motion contours drawn
+      bbox           — (x1, y1, x2, y2) or None
     """
     import base64 as _b64
 
@@ -174,7 +175,7 @@ def compute_motion_in_zone(frame_a_bytes, frame_b_bytes, polygon_points,
     img_a = cv2.imdecode(arr_a, cv2.IMREAD_COLOR)
     img_b = cv2.imdecode(arr_b, cv2.IMREAD_COLOR)
     if img_a is None or img_b is None:
-        return 0.0, None, None, None
+        return 0.0, None, None, None, None
     if img_a.shape != img_b.shape:
         img_b = cv2.resize(img_b, (img_a.shape[1], img_a.shape[0]))
 
@@ -186,7 +187,7 @@ def compute_motion_in_zone(frame_a_bytes, frame_b_bytes, polygon_points,
     cv2.fillPoly(zone_mask, [pts], 255)
     zone_area = cv2.countNonZero(zone_mask)
     if zone_area == 0:
-        return 0.0, None, None, None
+        return 0.0, None, None, None, None
 
     # Motion detection
     gray_a = cv2.cvtColor(img_a, cv2.COLOR_BGR2GRAY)
@@ -208,24 +209,36 @@ def compute_motion_in_zone(frame_a_bytes, frame_b_bytes, polygon_points,
     _, diff_enc = cv2.imencode('.jpg', diff_small, [cv2.IMWRITE_JPEG_QUALITY, 70])
     diff_b64 = _b64.b64encode(diff_enc.tobytes()).decode()
 
+    # Find contours for annotation + bounding box
+    contours, _ = cv2.findContours(zone_motion, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+
+    # Build annotated image: frame B + green motion contours + polygon outline
+    annotated = img_b.copy()
+    cv2.polylines(annotated, [pts], isClosed=True, color=(0, 180, 0), thickness=1)
+    if contours:
+        cv2.drawContours(annotated, contours, -1, (0, 255, 0), 2)
+    # Burn in motion % text
+    cv2.putText(annotated, f"{motion_pct:.2f}%", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    ann_small = cv2.resize(annotated, (320, 180))
+    _, ann_enc = cv2.imencode('.jpg', ann_small, [cv2.IMWRITE_JPEG_QUALITY, 75])
+    annotated_b64 = _b64.b64encode(ann_enc.tobytes()).decode()
+
     cropped_bytes = None
     bbox = None
 
-    if motion_pct >= threshold_pct:
-        # Find bounding box of motion within the zone
-        contours, _ = cv2.findContours(zone_motion, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            x1 = min(cv2.boundingRect(c)[0] for c in contours)
-            y1 = min(cv2.boundingRect(c)[1] for c in contours)
-            x2 = max(cv2.boundingRect(c)[0] + cv2.boundingRect(c)[2] for c in contours)
-            y2 = max(cv2.boundingRect(c)[1] + cv2.boundingRect(c)[3] for c in contours)
-            pad = int(crop_padding)
-            x1p, y1p = max(0, x1 - pad), max(0, y1 - pad)
-            x2p, y2p = min(w, x2 + pad), min(h, y2 + pad)
-            bbox = (x1p, y1p, x2p, y2p)
-            crop = img_b[y1p:y2p, x1p:x2p]
-            _, crop_enc = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
-            cropped_bytes = crop_enc.tobytes()
+    if motion_pct >= threshold_pct and contours:
+        x1 = min(cv2.boundingRect(c)[0] for c in contours)
+        y1 = min(cv2.boundingRect(c)[1] for c in contours)
+        x2 = max(cv2.boundingRect(c)[0] + cv2.boundingRect(c)[2] for c in contours)
+        y2 = max(cv2.boundingRect(c)[1] + cv2.boundingRect(c)[3] for c in contours)
+        pad = int(crop_padding)
+        x1p, y1p = max(0, x1 - pad), max(0, y1 - pad)
+        x2p, y2p = min(w, x2 + pad), min(h, y2 + pad)
+        bbox = (x1p, y1p, x2p, y2p)
+        crop = img_b[y1p:y2p, x1p:x2p]
+        _, crop_enc = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        cropped_bytes = crop_enc.tobytes()
 
-    return motion_pct, cropped_bytes, diff_b64, bbox
+    return motion_pct, cropped_bytes, diff_b64, annotated_b64, bbox

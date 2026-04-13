@@ -137,7 +137,7 @@ debug_window = None
 debug_labels = {}
 
 def show_debug_window(debug_images):
-    """Show/update a Toplevel window with all debug frames."""
+    """Show/update a Toplevel window with all debug frames (from webhook pipeline)."""
     global debug_window, debug_labels
 
     if not debug_mode_var.get():
@@ -149,7 +149,6 @@ def show_debug_window(debug_images):
         debug_window.configure(bg="#0a0a0a")
         debug_labels = {}
 
-    # Clear old widgets
     for w in debug_window.winfo_children():
         w.destroy()
     debug_labels = {}
@@ -161,21 +160,76 @@ def show_debug_window(debug_images):
         row, col = divmod(i, cols)
         frame = tk.Frame(debug_window, bg="#0a0a0a")
         frame.grid(row=row, column=col, padx=6, pady=6)
-
         tk.Label(frame, text=label, bg="#0a0a0a", fg="#555555",
                  font=("Courier New", 8, "bold")).pack()
-
         img_copy = pil_img.copy()
         img_copy.thumbnail((thumb_w, thumb_h), Image.LANCZOS)
-        # Convert to RGB if grayscale
         if img_copy.mode != "RGB":
             img_copy = img_copy.convert("RGB")
         photo = ImageTk.PhotoImage(img_copy)
         lbl = tk.Label(frame, image=photo, bg="#111111")
         lbl.image = photo
         lbl.pack()
-
     debug_window.lift()
+
+
+# ── Debug Motion Window — shows live motion per camera ───────────
+_motion_debug_win = None
+_motion_debug_labels = {}   # cam_name -> {"img": Label, "pct": Label}
+_motion_debug_photos = {}   # cam_name -> PhotoImage (prevent GC)
+
+def _update_motion_debug(cam_name, motion_pct, annotated_b64, triggered):
+    """Update one camera's panel in the debug motion window (main thread)."""
+    if not debug_mode_var.get():
+        return
+
+    global _motion_debug_win
+    if _motion_debug_win is None or not _motion_debug_win.winfo_exists():
+        _motion_debug_win = tk.Toplevel(root)
+        _motion_debug_win.title("Debug — Motion Detection")
+        _motion_debug_win.configure(bg="#0a0a0a")
+        _motion_debug_win.geometry("1200x700")
+        _motion_debug_labels.clear()
+        _motion_debug_photos.clear()
+
+    # Create panel for this camera if not yet built
+    if cam_name not in _motion_debug_labels:
+        idx = len(_motion_debug_labels)
+        cols = 4
+        r, c = divmod(idx, cols)
+        panel = tk.Frame(_motion_debug_win, bg="#0a0a0a")
+        panel.grid(row=r, column=c, padx=6, pady=6, sticky="n")
+
+        name_lbl = tk.Label(panel, text=cam_name, bg="#0a0a0a", fg="#555555",
+                            font=("Courier New", 8, "bold"))
+        name_lbl.pack()
+        pct_lbl = tk.Label(panel, text="—", bg="#0a0a0a", fg="#444444",
+                           font=("Courier New", 12, "bold"))
+        pct_lbl.pack()
+        img_lbl = tk.Label(panel, bg="#111111", width=40, height=12)
+        img_lbl.pack()
+        _motion_debug_labels[cam_name] = {
+            "name": name_lbl, "pct": pct_lbl, "img": img_lbl
+        }
+
+    entry = _motion_debug_labels[cam_name]
+
+    # Update percentage — color by trigger state
+    if triggered:
+        entry["pct"].config(text=f"{motion_pct:.2f}%", fg="#ff4444")
+    else:
+        entry["pct"].config(text=f"{motion_pct:.2f}%", fg="#00ff88")
+
+    # Update annotated image
+    if annotated_b64:
+        try:
+            img = Image.open(io.BytesIO(base64.b64decode(annotated_b64)))
+            img.thumbnail((300, 170), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            _motion_debug_photos[cam_name] = photo
+            entry["img"].config(image=photo, text="")
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------
 # SAVE
@@ -1662,16 +1716,23 @@ def _advanced_scanner_worker():
                     frame_a = jpeg_apply_mask(frame_a, cam.mask_rects)
                     frame_b = jpeg_apply_mask(frame_b, cam.mask_rects)
 
-                # Motion detection with the low advanced threshold
-                cropped_bytes, _, bbox = compute_motion_crop(
-                    frame_a, frame_b, threshold, cam.crop_padding_var.get()
-                )
+                cam_name = cam.cam_name_var.get()
+                pad = cam.crop_padding_var.get()
+
+                if cam.motion_zone and len(cam.motion_zone) >= 3:
+                    motion_pct, cropped_bytes, _, ann_b64, bbox = \
+                        compute_motion_in_zone(frame_a, frame_b,
+                                               cam.motion_zone, threshold, pad)
+                    root.after(0, lambda n=cam_name, p=motion_pct, a=ann_b64,
+                                        t=(cropped_bytes is not None):
+                               _update_motion_debug(n, p, a, t))
+                else:
+                    cropped_bytes, _, bbox = compute_motion_crop(
+                        frame_a, frame_b, threshold, pad)
 
                 if cropped_bytes is not None:
-                    # Motion detected — enqueue through normal pipeline
                     ts_float = time.time()
                     ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    cam_name = cam.cam_name_var.get()
                     print(f"[Advanced] Motion on {cam_name} — enqueuing")
                     cam.enqueue_event(ts_float, ts_str, source="advanced")
 
@@ -1741,19 +1802,25 @@ def _motion_ultra_worker():
                     frame_a = jpeg_apply_mask(frame_a, cam.mask_rects)
                     frame_b = jpeg_apply_mask(frame_b, cam.mask_rects)
 
-                motion_pct, cropped, diff_b64, bbox = compute_motion_in_zone(
+                motion_pct, cropped, diff_b64, ann_b64, bbox = compute_motion_in_zone(
                     frame_a, frame_b, cam.motion_zone,
                     threshold, cam.crop_padding_var.get()
                 )
 
-                # Update motion display on camera tab (always, even if below threshold)
+                # Update motion display on camera tab (always)
                 root.after(0, lambda c=cam, p=motion_pct, d=diff_b64:
                            c.update_motion_display(p, d))
 
-                if cropped is not None:
+                triggered = cropped is not None
+                cam_name = cam.cam_name_var.get()
+
+                # Update debug motion window
+                root.after(0, lambda n=cam_name, p=motion_pct, a=ann_b64, t=triggered:
+                           _update_motion_debug(n, p, a, t))
+
+                if triggered:
                     ts_float = time.time()
                     ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    cam_name = cam.cam_name_var.get()
                     print(f"[MotionUltra] {cam_name}: {motion_pct:.2f}% — enqueuing")
                     cam.enqueue_event(ts_float, ts_str, source="ultra")
 
