@@ -64,6 +64,7 @@ class CameraTab:
         self.buffer_lock  = threading.Lock()
         self.mask_rects   = []
         self.far_zones    = []
+        self.motion_zone  = []   # list of (x, y) native-res points forming a polygon
 
         # ── Stream thread state ───────────────────────────────────────────
         self._stream_running = False
@@ -155,7 +156,7 @@ class CameraTab:
         self.stream_label.pack()
 
         detected_panel = tk.Frame(panels, bg="#0a0a0a")
-        detected_panel.pack(side=tk.LEFT)
+        detected_panel.pack(side=tk.LEFT, padx=(0, 8))
         tk.Label(detected_panel, text="LAST DETECTED (AI CROP)", bg="#0a0a0a", fg="#333333",
                  font=("Courier New", 8, "bold")).pack(anchor="w")
         self.detected_label = tk.Label(
@@ -163,6 +164,20 @@ class CameraTab:
             text="Waiting for event...", fg="#333333",
             font=("Courier New", 9), anchor="center", relief=tk.FLAT)
         self.detected_label.pack()
+
+        # Motion amount + diff thumbnail
+        motion_panel = tk.Frame(panels, bg="#0a0a0a")
+        motion_panel.pack(side=tk.LEFT, anchor="n")
+        tk.Label(motion_panel, text="MOTION", bg="#0a0a0a", fg="#333333",
+                 font=("Courier New", 8, "bold")).pack(anchor="w")
+        self.motion_amount_var = tk.StringVar(value="—")
+        tk.Label(motion_panel, textvariable=self.motion_amount_var,
+                 bg="#0a0a0a", fg="#ff8800",
+                 font=("Courier New", 14, "bold")).pack(anchor="w")
+        self.motion_image_label = tk.Label(
+            motion_panel, bg="#111111", width=16, height=5,
+            text="", fg="#333333", font=("Courier New", 7))
+        self.motion_image_label.pack()
 
         # ── Output ──
         tk.Label(self.tab_frame, text="OUTPUT", bg="#0a0a0a", fg="#333333",
@@ -382,7 +397,7 @@ class CameraTab:
             ).start()
             return
 
-        if source in ("webhook", "advanced"):
+        if source in ("webhook", "advanced", "ultra"):
             ts_a   = ts_float - self.snap_before_var.get()
             ts_b   = ts_float - self.snap_after_var.get()
             frame_a = self.get_frame_at(ts_a)
@@ -439,6 +454,19 @@ class CameraTab:
             self.detected_label.image = photo
         except Exception:
             pass
+
+    def update_motion_display(self, motion_pct, diff_b64=None):
+        """Update the motion amount and optional diff thumbnail (main thread)."""
+        self.motion_amount_var.set(f"{motion_pct:.2f}%")
+        if diff_b64:
+            try:
+                img = Image.open(io.BytesIO(base64.b64decode(diff_b64)))
+                img.thumbnail((120, 68), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(img)
+                self.motion_image_label.config(image=photo, text="")
+                self.motion_image_label.image = photo
+            except Exception:
+                pass
 
     def update_stream_preview(self, image_b64):
         try:
@@ -539,9 +567,10 @@ class CameraTab:
             "buffer_secs": self.buffer_secs_var.get(),
             "crop_padding": self.crop_padding_var.get(),
             "min_box_pct": self.min_box_pct_var.get(),
-            "ha_sensor":   self.ha_sensor_var.get(),
-            "mask_rects":  [list(r) for r in self.mask_rects],
-            "far_zones":   [list(z) for z in self.far_zones],
+            "ha_sensor":    self.ha_sensor_var.get(),
+            "mask_rects":   [list(r) for r in self.mask_rects],
+            "far_zones":    [list(z) for z in self.far_zones],
+            "motion_zone":  [list(p) for p in self.motion_zone],
         }
 
     def from_dict(self, data):
@@ -571,3 +600,6 @@ class CameraTab:
         elif data.get("far_zone"):
             self.far_zones.clear()
             self.far_zones.append(tuple(data["far_zone"]))
+        if "motion_zone" in data:
+            self.motion_zone.clear()
+            self.motion_zone.extend(tuple(p) for p in data["motion_zone"])

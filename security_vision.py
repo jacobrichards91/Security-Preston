@@ -21,7 +21,8 @@ from constants import (
     HA_HOST, HA_TOKEN, WATCHED_ENTITIES, HA_NAMES, HA_GROUPS,
 )
 from priority_queue import NewestFirstQueue
-from motion import compute_motion_crop, compute_distance, jpeg_apply_mask
+from motion import (compute_motion_crop, compute_distance,
+                    jpeg_apply_mask, compute_motion_in_zone)
 from ollama_api import fmt_size, list_models, warmup, analyze_image_bytes, analyze_text
 from synthetic_sensors import SyntheticSensors
 from camera_tab import CameraTab
@@ -888,8 +889,10 @@ def save_config(*_):
             "text_prompt":     text_prompt_text.get("1.0", tk.END).rstrip("\n"),
             "system_active":   system_active_var.get(),
             "string_prompt":   string_prompt_text.get("1.0", tk.END).rstrip("\n"),
-            "adv_threshold":   adv_threshold_var.get(),
-            "adv_scan_interval": adv_scan_interval_var.get(),
+            "motion_threshold":  motion_threshold_var.get(),
+            "scan_interval":     scan_interval_var.get(),
+            "adv_mode_enabled":  adv_mode_enabled_var.get(),
+            "detection_mode":    detection_mode_var.get(),
             # Only persist cameras that have been verified by a live frame.
             "cameras":         [c.to_dict() for c in cameras if c.verified],
         }
@@ -929,10 +932,18 @@ def load_config():
         if "string_prompt" in data:
             string_prompt_text.delete("1.0", tk.END)
             string_prompt_text.insert("1.0", data["string_prompt"])
-        if "adv_threshold" in data:
-            adv_threshold_var.set(data["adv_threshold"])
-        if "adv_scan_interval" in data:
-            adv_scan_interval_var.set(data["adv_scan_interval"])
+        if "motion_threshold" in data:
+            motion_threshold_var.set(data["motion_threshold"])
+        elif "adv_threshold" in data:    # legacy key
+            motion_threshold_var.set(data["adv_threshold"])
+        if "scan_interval" in data:
+            scan_interval_var.set(data["scan_interval"])
+        elif "adv_scan_interval" in data:  # legacy key
+            scan_interval_var.set(data["adv_scan_interval"])
+        if "adv_mode_enabled" in data:
+            adv_mode_enabled_var.set(data["adv_mode_enabled"])
+        if "detection_mode" in data:
+            detection_mode_var.set(data["detection_mode"])
         # Rebuild each saved camera tab.
         for cam_data in data.get("cameras", []):
             cam = add_camera_tab(initial_data=cam_data, autostart=True)
@@ -1070,7 +1081,84 @@ toggle_btn = tk.Button(
     bg="#111111", fg="#00ff88", font=("Courier New", 14, "bold"),
     relief=tk.FLAT, padx=20, pady=14, cursor="hand2",
     activebackground="#003322", activeforeground="#00ff88", bd=0, width=20)
-toggle_btn.pack(anchor="w", pady=(0, 20))
+toggle_btn.pack(anchor="w", pady=(0, 10))
+
+# Detection mode toggle and global settings
+_mode_frame = tk.Frame(master_left, bg="#0a0a0a")
+_mode_frame.pack(fill=tk.X, pady=(0, 10))
+
+# Advanced mode on/off
+adv_mode_enabled_var = tk.BooleanVar(value=True)
+def _update_adv_toggle(*_):
+    on = adv_mode_enabled_var.get()
+    _adv_toggle_btn.config(
+        text="● ADV MODE  ON" if on else "○ ADV MODE  OFF",
+        fg="#00aaff" if on else "#444444",
+        activeforeground="#00aaff" if on else "#444444")
+    schedule_save()
+adv_mode_enabled_var.trace_add("write", _update_adv_toggle)
+_adv_toggle_btn = tk.Button(
+    _mode_frame, text="● ADV MODE  ON",
+    command=lambda: adv_mode_enabled_var.set(not adv_mode_enabled_var.get()),
+    bg="#111111", fg="#00aaff", font=("Courier New", 10, "bold"),
+    relief=tk.FLAT, padx=12, pady=8, cursor="hand2",
+    activebackground="#001a33", activeforeground="#00aaff", bd=0, width=18)
+_adv_toggle_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+# Detection mode: Webhook+PD  or  PD+MotionUltra
+detection_mode_var = tk.StringVar(value="webhook_pd")
+def _update_det_mode(*_):
+    mode = detection_mode_var.get()
+    if mode == "webhook_pd":
+        _det_mode_btn.config(text="⚡ WEBHOOK + PD", fg="#00ff88",
+                             activeforeground="#00ff88")
+        _stop_motion_ultra()
+    else:
+        _det_mode_btn.config(text="🔍 PD + MOTION ULTRA", fg="#ff8800",
+                             activeforeground="#ff8800")
+        _start_motion_ultra()
+    schedule_save()
+def _cycle_det_mode():
+    if detection_mode_var.get() == "webhook_pd":
+        detection_mode_var.set("pd_ultra")
+    else:
+        detection_mode_var.set("webhook_pd")
+detection_mode_var.trace_add("write", _update_det_mode)
+_det_mode_btn = tk.Button(
+    _mode_frame, text="⚡ WEBHOOK + PD",
+    command=_cycle_det_mode,
+    bg="#111111", fg="#00ff88", font=("Courier New", 10, "bold"),
+    relief=tk.FLAT, padx=12, pady=8, cursor="hand2",
+    activebackground="#003322", activeforeground="#00ff88", bd=0, width=22)
+_det_mode_btn.pack(side=tk.LEFT)
+
+# Global motion threshold (used by advanced mode + motion ultra)
+_thresh_frame = tk.Frame(master_left, bg="#0a0a0a")
+_thresh_frame.pack(fill=tk.X, pady=(0, 10))
+tk.Label(_thresh_frame, text="MOTION THRESHOLD", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8, "bold")).pack(side=tk.LEFT, padx=(0, 8))
+motion_threshold_var = tk.DoubleVar(value=0.01)
+tk.Spinbox(_thresh_frame, textvariable=motion_threshold_var,
+           from_=0.001, to=10.0, increment=0.005, format="%.3f", width=7,
+           bg="#111111", fg="#00ff88", buttonbackground="#1a1a1a",
+           relief=tk.FLAT, font=("Courier New", 9),
+           insertbackground="#00ff88", highlightthickness=0
+           ).pack(side=tk.LEFT, padx=(0, 2))
+tk.Label(_thresh_frame, text="%", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8)).pack(side=tk.LEFT, padx=(0, 12))
+tk.Label(_thresh_frame, text="scan interval", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8)).pack(side=tk.LEFT, padx=(0, 4))
+scan_interval_var = tk.DoubleVar(value=1.0)
+tk.Spinbox(_thresh_frame, textvariable=scan_interval_var,
+           from_=0.5, to=10.0, increment=0.5, format="%.1f", width=5,
+           bg="#111111", fg="#00ff88", buttonbackground="#1a1a1a",
+           relief=tk.FLAT, font=("Courier New", 9),
+           insertbackground="#00ff88", highlightthickness=0
+           ).pack(side=tk.LEFT, padx=(0, 2))
+tk.Label(_thresh_frame, text="s", bg="#0a0a0a", fg="#444444",
+         font=("Courier New", 8)).pack(side=tk.LEFT)
+motion_threshold_var.trace_add("write", schedule_save)
+scan_interval_var.trace_add("write", schedule_save)
 
 # Models — two side-by-side
 model_row = tk.Frame(master_left, bg="#0a0a0a")
@@ -1366,52 +1454,15 @@ _str_right = tk.Frame(_string_cols, bg="#0d0d0d", width=360)
 _str_right.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 0), pady=0)
 _str_right.pack_propagate(False)
 
-tk.Label(_str_right, text="STRING PROMPT", bg="#0d0d0d", fg="#444444",
-         font=("Courier New", 8, "bold"), padx=12).pack(anchor="w", pady=(10, 4))
-
-# ── Advanced mode settings ──
-_adv_frame = tk.Frame(_str_right, bg="#0d0d0d")
-_adv_frame.pack(fill=tk.X, padx=12, pady=(0, 8))
-tk.Label(_adv_frame, text="ADVANCED MODE", bg="#0d0d0d", fg="#444444",
-         font=("Courier New", 8, "bold")).pack(anchor="w", pady=(0, 4))
-tk.Label(_adv_frame, text="Activates when 2+ cameras detect motion",
-         bg="#0d0d0d", fg="#333333", font=("Courier New", 7)).pack(anchor="w")
-
-_adv_settings = tk.Frame(_adv_frame, bg="#0d0d0d")
-_adv_settings.pack(fill=tk.X, pady=(4, 0))
-
-tk.Label(_adv_settings, text="motion threshold", bg="#0d0d0d", fg="#555555",
-         font=("Courier New", 8)).pack(side=tk.LEFT)
-adv_threshold_var = tk.DoubleVar(value=0.01)   # very low default
-tk.Spinbox(_adv_settings, textvariable=adv_threshold_var,
-           from_=0.001, to=5.0, increment=0.005, format="%.3f", width=7,
-           bg="#111111", fg="#00ff88", buttonbackground="#1a1a1a",
-           relief=tk.FLAT, font=("Courier New", 9),
-           insertbackground="#00ff88", highlightthickness=0
-           ).pack(side=tk.LEFT, padx=(4, 2))
-tk.Label(_adv_settings, text="%", bg="#0d0d0d", fg="#444444",
-         font=("Courier New", 8)).pack(side=tk.LEFT, padx=(0, 12))
-
-tk.Label(_adv_settings, text="scan interval", bg="#0d0d0d", fg="#555555",
-         font=("Courier New", 8)).pack(side=tk.LEFT)
-adv_scan_interval_var = tk.DoubleVar(value=1.0)   # 1s between pairs
-tk.Spinbox(_adv_settings, textvariable=adv_scan_interval_var,
-           from_=0.5, to=5.0, increment=0.5, format="%.1f", width=5,
-           bg="#111111", fg="#00ff88", buttonbackground="#1a1a1a",
-           relief=tk.FLAT, font=("Courier New", 9),
-           insertbackground="#00ff88", highlightthickness=0
-           ).pack(side=tk.LEFT, padx=(4, 2))
-tk.Label(_adv_settings, text="s", bg="#0d0d0d", fg="#444444",
-         font=("Courier New", 8)).pack(side=tk.LEFT)
-
 _adv_status_var = tk.StringVar(value="")
-_adv_status_lbl = tk.Label(_adv_frame, textvariable=_adv_status_var,
-                            bg="#0d0d0d", fg="#ff4444",
-                            font=("Courier New", 8, "bold"))
-_adv_status_lbl.pack(anchor="w", pady=(4, 0))
+_adv_status_lbl = tk.Label(
+    _str_right, textvariable=_adv_status_var,
+    bg="#0d0d0d", fg="#ff4444", font=("Courier New", 8, "bold"),
+    padx=12, anchor="w")
+_adv_status_lbl.pack(fill=tk.X, pady=(10, 4))
 
-adv_threshold_var.trace_add("write", schedule_save)
-adv_scan_interval_var.trace_add("write", schedule_save)
+tk.Label(_str_right, text="STRING PROMPT", bg="#0d0d0d", fg="#444444",
+         font=("Courier New", 8, "bold"), padx=12).pack(anchor="w", pady=(0, 4))
 _str_prompt_frame = tk.Frame(_str_right, bg="#0d0d0d")
 _str_prompt_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
 string_prompt_text = tk.Text(
@@ -1566,6 +1617,9 @@ _adv_scanner_running = False
 def _on_advanced_start(s):
     """Called on main thread when 2+ cameras trigger advanced mode."""
     global _adv_scanner_running
+    if not adv_mode_enabled_var.get():
+        print("[Advanced] Skipped — advanced mode is disabled")
+        return
     _adv_status_var.set("● ADVANCED MODE ACTIVE — continuous scanning")
     _adv_status_lbl.config(fg="#ff4444")
     _string_status_var.set(
@@ -1598,8 +1652,8 @@ def _advanced_scanner_worker():
     """
     print("[Advanced] Scanner started")
     while _adv_scanner_running:
-        interval = adv_scan_interval_var.get()
-        threshold = adv_threshold_var.get()
+        interval = scan_interval_var.get()
+        threshold = motion_threshold_var.get()
         cycle_start = time.time()
 
         for cam in cameras:
@@ -1648,6 +1702,87 @@ def _advanced_scanner_worker():
             time.sleep(remaining)
 
     print("[Advanced] Scanner stopped")
+
+
+# ── Motion Ultra: continuous motion scanning in defined zones ────
+_ultra_running = False
+
+def _start_motion_ultra():
+    global _ultra_running
+    if _ultra_running:
+        return
+    _ultra_running = True
+    # Ensure all cameras with RTSP are streaming
+    for cam in cameras:
+        if cam.rtsp_url_var.get().strip() and not cam._stream_running:
+            cam.start_stream()
+    threading.Thread(target=_motion_ultra_worker, daemon=True).start()
+    print("[MotionUltra] Started")
+
+def _stop_motion_ultra():
+    global _ultra_running
+    _ultra_running = False
+    print("[MotionUltra] Stopped")
+
+def _motion_ultra_worker():
+    """
+    Continuous motion scanner using per-camera motion zones.
+    Runs when detection_mode == "pd_ultra".
+    """
+    while _ultra_running:
+        interval = scan_interval_var.get()
+        threshold = motion_threshold_var.get()
+        cycle_start = time.time()
+
+        for cam in cameras:
+            if not _ultra_running:
+                break
+            if not cam.rtsp_url_var.get().strip() or not cam._stream_running:
+                continue
+            if not cam.motion_zone or len(cam.motion_zone) < 3:
+                continue  # need at least a triangle
+
+            try:
+                frame_a = cam.get_frame_at(time.time())
+                if frame_a is None:
+                    continue
+                time.sleep(0.5)
+                if not _ultra_running:
+                    break
+                frame_b = cam.get_frame_at(time.time())
+                if frame_b is None:
+                    continue
+
+                # Apply exclusion masks first
+                if cam.mask_rects:
+                    frame_a = jpeg_apply_mask(frame_a, cam.mask_rects)
+                    frame_b = jpeg_apply_mask(frame_b, cam.mask_rects)
+
+                motion_pct, cropped, diff_b64, bbox = compute_motion_in_zone(
+                    frame_a, frame_b, cam.motion_zone,
+                    threshold, cam.crop_padding_var.get()
+                )
+
+                # Update motion display on camera tab (always, even if below threshold)
+                root.after(0, lambda c=cam, p=motion_pct, d=diff_b64:
+                           c.update_motion_display(p, d))
+
+                if cropped is not None:
+                    ts_float = time.time()
+                    ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    cam_name = cam.cam_name_var.get()
+                    print(f"[MotionUltra] {cam_name}: {motion_pct:.2f}% — enqueuing")
+                    cam.enqueue_event(ts_float, ts_str, source="ultra")
+
+            except Exception as e:
+                print(f"[MotionUltra] Error on {cam.cam_name_var.get()}: {e}")
+
+        elapsed = time.time() - cycle_start
+        remaining = max(0, interval - elapsed)
+        if remaining > 0 and _ultra_running:
+            time.sleep(remaining)
+
+    print("[MotionUltra] Worker stopped")
 
 
 def _save_string_to_disk(string_dict):
@@ -1786,5 +1921,9 @@ threading.Thread(target=run_flask,    daemon=True).start()
 threading.Thread(target=queue_worker, daemon=True).start()
 threading.Thread(target=warmup_model, daemon=True).start()
 threading.Thread(target=ha_worker,    daemon=True).start()
+
+# Start Motion Ultra if detection mode was restored from config
+if detection_mode_var.get() == "pd_ultra":
+    root.after(2000, _start_motion_ultra)   # delay to let streams connect
 
 root.mainloop()

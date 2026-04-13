@@ -149,3 +149,83 @@ def compute_distance(bbox, far_zones):
         if x1 >= fx1 and y1 >= fy1 and x2 <= fx2 and y2 <= fy2:
             return "more than 15 feet from house"
     return "closer than 15 feet to house"
+
+
+def compute_motion_in_zone(frame_a_bytes, frame_b_bytes, polygon_points,
+                           threshold_pct, crop_padding=50):
+    """
+    Detect motion within a polygon-defined zone.
+
+    Args:
+      polygon_points — list of (x, y) tuples in native resolution
+      threshold_pct  — minimum motion as % of polygon area to trigger
+
+    Returns:
+      (motion_pct, cropped_bytes, diff_b64, bbox)
+      motion_pct   — float, percent of polygon area with motion
+      cropped_bytes — JPEG bytes of the motion crop (or None)
+      diff_b64     — base64 string of the thresholded diff image (for debug)
+      bbox         — (x1, y1, x2, y2) or None
+    """
+    import base64 as _b64
+
+    arr_a = np.frombuffer(frame_a_bytes, dtype=np.uint8)
+    arr_b = np.frombuffer(frame_b_bytes, dtype=np.uint8)
+    img_a = cv2.imdecode(arr_a, cv2.IMREAD_COLOR)
+    img_b = cv2.imdecode(arr_b, cv2.IMREAD_COLOR)
+    if img_a is None or img_b is None:
+        return 0.0, None, None, None
+    if img_a.shape != img_b.shape:
+        img_b = cv2.resize(img_b, (img_a.shape[1], img_a.shape[0]))
+
+    h, w = img_a.shape[:2]
+
+    # Create polygon mask
+    pts = np.array(polygon_points, dtype=np.int32).reshape((-1, 1, 2))
+    zone_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(zone_mask, [pts], 255)
+    zone_area = cv2.countNonZero(zone_mask)
+    if zone_area == 0:
+        return 0.0, None, None, None
+
+    # Motion detection
+    gray_a = cv2.cvtColor(img_a, cv2.COLOR_BGR2GRAY)
+    gray_b = cv2.cvtColor(img_b, cv2.COLOR_BGR2GRAY)
+    blur_a = cv2.GaussianBlur(gray_a, (21, 21), 0)
+    blur_b = cv2.GaussianBlur(gray_b, (21, 21), 0)
+    diff = cv2.absdiff(blur_a, blur_b)
+    _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    dilated = cv2.dilate(thresh, kernel, iterations=2)
+
+    # Mask to polygon zone only
+    zone_motion = cv2.bitwise_and(dilated, zone_mask)
+    motion_pixels = cv2.countNonZero(zone_motion)
+    motion_pct = (motion_pixels / zone_area) * 100.0
+
+    # Encode diff image for display
+    diff_small = cv2.resize(zone_motion, (320, 180))
+    _, diff_enc = cv2.imencode('.jpg', diff_small, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    diff_b64 = _b64.b64encode(diff_enc.tobytes()).decode()
+
+    cropped_bytes = None
+    bbox = None
+
+    if motion_pct >= threshold_pct:
+        # Find bounding box of motion within the zone
+        contours, _ = cv2.findContours(zone_motion, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            x1 = min(cv2.boundingRect(c)[0] for c in contours)
+            y1 = min(cv2.boundingRect(c)[1] for c in contours)
+            x2 = max(cv2.boundingRect(c)[0] + cv2.boundingRect(c)[2] for c in contours)
+            y2 = max(cv2.boundingRect(c)[1] + cv2.boundingRect(c)[3] for c in contours)
+            pad = int(crop_padding)
+            x1p, y1p = max(0, x1 - pad), max(0, y1 - pad)
+            x2p, y2p = min(w, x2 + pad), min(h, y2 + pad)
+            bbox = (x1p, y1p, x2p, y2p)
+            crop = img_b[y1p:y2p, x1p:x2p]
+            _, crop_enc = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
+            cropped_bytes = crop_enc.tobytes()
+
+    return motion_pct, cropped_bytes, diff_b64, bbox
