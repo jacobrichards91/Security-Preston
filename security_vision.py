@@ -889,7 +889,6 @@ def save_config(*_):
             "text_prompt":     text_prompt_text.get("1.0", tk.END).rstrip("\n"),
             "system_active":   system_active_var.get(),
             "string_prompt":   string_prompt_text.get("1.0", tk.END).rstrip("\n"),
-            "motion_threshold":  motion_threshold_var.get(),
             "scan_interval":     scan_interval_var.get(),
             "adv_mode_enabled":  adv_mode_enabled_var.get(),
             "detection_mode":    detection_mode_var.get(),
@@ -932,10 +931,6 @@ def load_config():
         if "string_prompt" in data:
             string_prompt_text.delete("1.0", tk.END)
             string_prompt_text.insert("1.0", data["string_prompt"])
-        if "motion_threshold" in data:
-            motion_threshold_var.set(data["motion_threshold"])
-        elif "adv_threshold" in data:    # legacy key
-            motion_threshold_var.set(data["adv_threshold"])
         if "scan_interval" in data:
             scan_interval_var.set(data["scan_interval"])
         elif "adv_scan_interval" in data:  # legacy key
@@ -1132,32 +1127,20 @@ _det_mode_btn = tk.Button(
     activebackground="#003322", activeforeground="#00ff88", bd=0, width=22)
 _det_mode_btn.pack(side=tk.LEFT)
 
-# Global motion threshold (used by advanced mode + motion ultra)
-_thresh_frame = tk.Frame(master_left, bg="#0a0a0a")
-_thresh_frame.pack(fill=tk.X, pady=(0, 10))
-tk.Label(_thresh_frame, text="MOTION THRESHOLD", bg="#0a0a0a", fg="#444444",
+# Scan interval (global — threshold is per-camera in settings row)
+_scan_frame = tk.Frame(master_left, bg="#0a0a0a")
+_scan_frame.pack(fill=tk.X, pady=(0, 10))
+tk.Label(_scan_frame, text="SCAN INTERVAL", bg="#0a0a0a", fg="#444444",
          font=("Courier New", 8, "bold")).pack(side=tk.LEFT, padx=(0, 8))
-motion_threshold_var = tk.DoubleVar(value=0.01)
-tk.Spinbox(_thresh_frame, textvariable=motion_threshold_var,
-           from_=0.001, to=10.0, increment=0.005, format="%.3f", width=7,
-           bg="#111111", fg="#00ff88", buttonbackground="#1a1a1a",
-           relief=tk.FLAT, font=("Courier New", 9),
-           insertbackground="#00ff88", highlightthickness=0
-           ).pack(side=tk.LEFT, padx=(0, 2))
-tk.Label(_thresh_frame, text="%", bg="#0a0a0a", fg="#444444",
-         font=("Courier New", 8)).pack(side=tk.LEFT, padx=(0, 12))
-tk.Label(_thresh_frame, text="scan interval", bg="#0a0a0a", fg="#444444",
-         font=("Courier New", 8)).pack(side=tk.LEFT, padx=(0, 4))
 scan_interval_var = tk.DoubleVar(value=1.0)
-tk.Spinbox(_thresh_frame, textvariable=scan_interval_var,
+tk.Spinbox(_scan_frame, textvariable=scan_interval_var,
            from_=0.5, to=10.0, increment=0.5, format="%.1f", width=5,
            bg="#111111", fg="#00ff88", buttonbackground="#1a1a1a",
            relief=tk.FLAT, font=("Courier New", 9),
            insertbackground="#00ff88", highlightthickness=0
            ).pack(side=tk.LEFT, padx=(0, 2))
-tk.Label(_thresh_frame, text="s", bg="#0a0a0a", fg="#444444",
-         font=("Courier New", 8)).pack(side=tk.LEFT)
-motion_threshold_var.trace_add("write", schedule_save)
+tk.Label(_scan_frame, text="s  (motion threshold is per-camera)", bg="#0a0a0a", fg="#333333",
+         font=("Courier New", 7)).pack(side=tk.LEFT, padx=(4, 0))
 scan_interval_var.trace_add("write", schedule_save)
 
 # Models — two side-by-side
@@ -1653,7 +1636,6 @@ def _advanced_scanner_worker():
     print("[Advanced] Scanner started")
     while _adv_scanner_running:
         interval = scan_interval_var.get()
-        threshold = motion_threshold_var.get()
         cycle_start = time.time()
 
         for cam in cameras:
@@ -1661,6 +1643,7 @@ def _advanced_scanner_worker():
                 break
             if not cam.rtsp_url_var.get().strip() or not cam._stream_running:
                 continue
+            threshold = cam.motion_thresh_var.get()
 
             try:
                 # Grab frame pair: A = now, B = 0.5s later
@@ -1731,7 +1714,6 @@ def _motion_ultra_worker():
     """
     while _ultra_running:
         interval = scan_interval_var.get()
-        threshold = motion_threshold_var.get()
         cycle_start = time.time()
 
         for cam in cameras:
@@ -1741,6 +1723,7 @@ def _motion_ultra_worker():
                 continue
             if not cam.motion_zone or len(cam.motion_zone) < 3:
                 continue  # need at least a triangle
+            threshold = cam.motion_thresh_var.get()
 
             try:
                 frame_a = cam.get_frame_at(time.time())

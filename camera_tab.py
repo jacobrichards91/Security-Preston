@@ -57,6 +57,7 @@ class CameraTab:
         self.buffer_secs_var  = tk.DoubleVar(root, value=BUFFER_SECONDS)
         self.crop_padding_var = tk.IntVar(root,    value=CROP_PADDING)
         self.min_box_pct_var  = tk.DoubleVar(root, value=MIN_BOX_PCT)
+        self.motion_thresh_var = tk.DoubleVar(root, value=0.01)  # per-camera motion ultra threshold %
         self.ha_sensor_var    = tk.StringVar(root, value="")  # HA person_detected entity
 
         # ── Buffer state ──────────────────────────────────────────────────
@@ -88,7 +89,8 @@ class CameraTab:
         # Debounce-save on any setting change (only after verification).
         for v in (self.rtsp_url_var, self.cam_name_var, self.cam_id_var,
                   self.snap_before_var, self.snap_after_var, self.buffer_secs_var,
-                  self.crop_padding_var, self.min_box_pct_var, self.ha_sensor_var):
+                  self.crop_padding_var, self.min_box_pct_var, self.motion_thresh_var,
+                  self.ha_sensor_var):
             v.trace_add("write", lambda *_: self._maybe_save())
 
         # Update tab label when name changes
@@ -232,6 +234,7 @@ class CameraTab:
         self._spin(timing_frame, "after",    self.snap_after_var,   0.0,  29.0, 0.1)
         self._spin(timing_frame, "padding",  self.crop_padding_var, 0,    500,  10,  unit="px")
         self._spin(timing_frame, "min box",  self.min_box_pct_var,  0.0,  10.0, 0.01, unit="%")
+        self._spin(timing_frame, "motion",   self.motion_thresh_var, 0.001, 10.0, 0.005, unit="%")
         tk.Label(timing_frame, text="cam ID", bg="#0a0a0a", fg="#444444",
                  font=("Courier New", 8)).pack(side=tk.LEFT, padx=(12, 2))
         tk.Entry(timing_frame, textvariable=self.cam_id_var, width=14,
@@ -566,8 +569,9 @@ class CameraTab:
             "snap_after":  self.snap_after_var.get(),
             "buffer_secs": self.buffer_secs_var.get(),
             "crop_padding": self.crop_padding_var.get(),
-            "min_box_pct": self.min_box_pct_var.get(),
-            "ha_sensor":    self.ha_sensor_var.get(),
+            "min_box_pct":    self.min_box_pct_var.get(),
+            "motion_thresh": self.motion_thresh_var.get(),
+            "ha_sensor":     self.ha_sensor_var.get(),
             "mask_rects":   [list(r) for r in self.mask_rects],
             "far_zones":    [list(z) for z in self.far_zones],
             "motion_zone":  [list(p) for p in self.motion_zone],
@@ -582,6 +586,7 @@ class CameraTab:
         if "buffer_secs"  in data: self.buffer_secs_var.set(data["buffer_secs"])
         if "crop_padding" in data: self.crop_padding_var.set(data["crop_padding"])
         if "min_box_pct"  in data: self.min_box_pct_var.set(data["min_box_pct"])
+        if "motion_thresh" in data: self.motion_thresh_var.set(data["motion_thresh"])
         if "ha_sensor" in data:
             self.ha_sensor_var.set(data["ha_sensor"])
             # Update combo display
