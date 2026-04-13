@@ -173,63 +173,59 @@ def show_debug_window(debug_images):
     debug_window.lift()
 
 
-# ── Debug Motion Window — shows live motion per camera ───────────
+# ── Debug Motion Log — triggered events only (scrollable list) ───
 _motion_debug_win = None
-_motion_debug_labels = {}   # cam_name -> {"img": Label, "pct": Label}
-_motion_debug_photos = {}   # cam_name -> PhotoImage (prevent GC)
+_motion_debug_text = None
+_motion_debug_photos = []   # keep refs to prevent GC
 
-def _update_motion_debug(cam_name, motion_pct, annotated_b64, triggered):
-    """Update one camera's panel in the debug motion window (main thread)."""
+def _log_motion_event(cam_name, motion_pct, annotated_b64):
+    """Add one triggered motion event to the debug log (main thread only)."""
     if not debug_mode_var.get():
         return
 
-    global _motion_debug_win
+    global _motion_debug_win, _motion_debug_text
     if _motion_debug_win is None or not _motion_debug_win.winfo_exists():
         _motion_debug_win = tk.Toplevel(root)
-        _motion_debug_win.title("Debug — Motion Detection")
+        _motion_debug_win.title("Debug — Motion Triggers")
         _motion_debug_win.configure(bg="#0a0a0a")
-        _motion_debug_win.geometry("1200x700")
-        _motion_debug_labels.clear()
+        _motion_debug_win.geometry("700x600")
+        _motion_debug_win.resizable(True, True)
+
+        _frm = tk.Frame(_motion_debug_win, bg="#0a0a0a")
+        _frm.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        _motion_debug_text = tk.Text(
+            _frm, bg="#111111", fg="#888888",
+            font=("Courier New", 9), relief=tk.FLAT,
+            padx=8, pady=6, wrap=tk.WORD, state=tk.DISABLED,
+            selectbackground="#003322")
+        _scr = tk.Scrollbar(_frm, command=_motion_debug_text.yview, bg="#111111")
+        _motion_debug_text.configure(yscrollcommand=_scr.set)
+        _scr.pack(side=tk.RIGHT, fill=tk.Y)
+        _motion_debug_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        _motion_debug_text.tag_configure("ts",  foreground="#00aaff", font=("Courier New", 9, "bold"))
+        _motion_debug_text.tag_configure("cam", foreground="#00ff88", font=("Courier New", 9))
+        _motion_debug_text.tag_configure("pct", foreground="#ff4444", font=("Courier New", 11, "bold"))
         _motion_debug_photos.clear()
 
-    # Create panel for this camera if not yet built
-    if cam_name not in _motion_debug_labels:
-        idx = len(_motion_debug_labels)
-        cols = 4
-        r, c = divmod(idx, cols)
-        panel = tk.Frame(_motion_debug_win, bg="#0a0a0a")
-        panel.grid(row=r, column=c, padx=6, pady=6, sticky="n")
+    ts = datetime.now().strftime("%H:%M:%S")
+    _motion_debug_text.config(state=tk.NORMAL)
+    _motion_debug_text.insert(tk.END, f"{ts}  ", "ts")
+    _motion_debug_text.insert(tk.END, f"[{cam_name}]  ", "cam")
+    _motion_debug_text.insert(tk.END, f"{motion_pct:.2f}%\n", "pct")
 
-        name_lbl = tk.Label(panel, text=cam_name, bg="#0a0a0a", fg="#555555",
-                            font=("Courier New", 8, "bold"))
-        name_lbl.pack()
-        pct_lbl = tk.Label(panel, text="—", bg="#0a0a0a", fg="#444444",
-                           font=("Courier New", 12, "bold"))
-        pct_lbl.pack()
-        img_lbl = tk.Label(panel, bg="#111111", width=40, height=12)
-        img_lbl.pack()
-        _motion_debug_labels[cam_name] = {
-            "name": name_lbl, "pct": pct_lbl, "img": img_lbl
-        }
-
-    entry = _motion_debug_labels[cam_name]
-
-    # Update percentage — color by trigger state
-    if triggered:
-        entry["pct"].config(text=f"{motion_pct:.2f}%", fg="#ff4444")
-    else:
-        entry["pct"].config(text=f"{motion_pct:.2f}%", fg="#00ff88")
-
-    # Update annotated image
     if annotated_b64:
         try:
             img = Image.open(io.BytesIO(base64.b64decode(annotated_b64)))
-            img.thumbnail((300, 170), Image.LANCZOS)
+            img.thumbnail((320, 180), Image.LANCZOS)
             photo = ImageTk.PhotoImage(img)
-            _motion_debug_photos[cam_name] = photo
-            entry["img"].config(image=photo, text="")
+            _motion_debug_photos.append(photo)
+            _motion_debug_text.image_create(tk.END, image=photo, padx=4, pady=2)
+            _motion_debug_text.insert(tk.END, "\n\n")
         except Exception:
-            pass
+            _motion_debug_text.insert(tk.END, "\n")
+
+    _motion_debug_text.config(state=tk.DISABLED)
+    _motion_debug_text.see(tk.END)
 
 # ---------------------------------------------------------------
 # SAVE
@@ -1723,9 +1719,9 @@ def _advanced_scanner_worker():
                     motion_pct, cropped_bytes, _, ann_b64, bbox = \
                         compute_motion_in_zone(frame_a, frame_b,
                                                cam.motion_zone, threshold, pad)
-                    root.after(0, lambda n=cam_name, p=motion_pct, a=ann_b64,
-                                        t=(cropped_bytes is not None):
-                               _update_motion_debug(n, p, a, t))
+                    if cropped_bytes is not None:
+                        root.after(0, lambda n=cam_name, p=motion_pct, a=ann_b64:
+                                   _log_motion_event(n, p, a))
                 else:
                     cropped_bytes, _, bbox = compute_motion_crop(
                         frame_a, frame_b, threshold, pad)
@@ -1811,14 +1807,12 @@ def _motion_ultra_worker():
                 root.after(0, lambda c=cam, p=motion_pct, d=diff_b64:
                            c.update_motion_display(p, d))
 
-                triggered = cropped is not None
                 cam_name = cam.cam_name_var.get()
 
-                # Update debug motion window
-                root.after(0, lambda n=cam_name, p=motion_pct, a=ann_b64, t=triggered:
-                           _update_motion_debug(n, p, a, t))
-
-                if triggered:
+                if cropped is not None:
+                    # Log to debug motion window
+                    root.after(0, lambda n=cam_name, p=motion_pct, a=ann_b64:
+                               _log_motion_event(n, p, a))
                     ts_float = time.time()
                     ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     print(f"[MotionUltra] {cam_name}: {motion_pct:.2f}% — enqueuing")
